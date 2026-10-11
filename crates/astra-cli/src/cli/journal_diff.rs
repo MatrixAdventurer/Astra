@@ -18,7 +18,7 @@
 //! presence cover the "did behavior change" question without
 //! drowning the reviewer in wall-of-text diffs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::Serialize;
 
@@ -213,41 +213,86 @@ fn is_terminal(e: &JournalEvent) -> bool {
     )
 }
 
-/// Index of the terminal (`turn` / `turn_error`) that owns the round at
-/// `round_idx`, searched over the whole snapshot: a round can be written
-/// after its terminal. A turn number alone does not identify an attempt,
-/// so when both sides carry a run id they must match; a round without a
-/// run id (or a terminal without one) falls back to the turn number.
-/// Among candidates, an exact run-id match wins, then the first terminal at
-/// or after the round, then the nearest one before it.
-fn owning_terminal(events: &[JournalEvent], round_idx: usize) -> Option<usize> {
-    let round = &events[round_idx];
-    let turn = round.turn?;
-    let round_run = run_id_of(round);
-    let mut best: Option<(bool, bool, usize)> = None;
-    for (idx, e) in events.iter().enumerate() {
-        if !is_terminal(e) || e.turn != Some(turn) {
-            continue;
-        }
-        let exact = match (round_run, run_id_of(e)) {
-            (Some(r), Some(t)) if r != t => continue,
-            (Some(_), Some(_)) => true,
-            _ => false,
-        };
-        let after = idx > round_idx;
-        let better = match best {
-            None => true,
-            Some((b_exact, b_after, b_idx)) => {
-                (exact, after) > (b_exact, b_after)
-                    || ((exact, after) == (b_exact, b_after)
-                        && if after { idx < b_idx } else { idx > b_idx })
+/// A round produced by a child run (sub-agent): its producer scope names a
+/// parent run or agent, or its purpose is `sub_agent`. Child runs can carry
+/// the root session turn number, so such a round must never be folded into a
+/// terminal whose run identity is unknown.
+fn is_child_round(e: &JournalEvent) -> bool {
+    e.producer_scope
+        .as_ref()
+        .is_some_and(|s| s.parent_run_id.is_some() || s.agent_id.is_some())
+        || e.metadata
+            .as_ref()
+            .and_then(|m| m.get("purpose"))
+            .and_then(|p| p.as_str())
+            == Some("sub_agent")
+}
+
+/// Terminal (`turn` / `turn_error`) positions indexed once per snapshot, so
+/// resolving a round's owner is a few binary searches instead of a scan.
+#[derive(Default)]
+struct TerminalIndex<'a> {
+    /// (turn, run id) -> terminals carrying that run id.
+    by_run: HashMap<(u32, &'a str), Vec<usize>>,
+    /// turn -> terminals without a run id.
+    anonymous: HashMap<u32, Vec<usize>>,
+    /// turn -> all terminals.
+    any: HashMap<u32, Vec<usize>>,
+}
+
+impl<'a> TerminalIndex<'a> {
+    fn new(events: &'a [JournalEvent]) -> Self {
+        let mut idx = Self::default();
+        for (i, e) in events.iter().enumerate() {
+            let Some(turn) = e.turn.filter(|_| is_terminal(e)) else {
+                continue;
+            };
+            match run_id_of(e) {
+                Some(run) => idx.by_run.entry((turn, run)).or_default().push(i),
+                None => idx.anonymous.entry(turn).or_default().push(i),
             }
+            idx.any.entry(turn).or_default().push(i);
+        }
+        idx
+    }
+
+    /// Index of the terminal that owns the round at `round_idx`, searched
+    /// over the whole snapshot: a round can be written after its terminal.
+    /// A turn number alone does not identify an attempt, so when both sides
+    /// carry a run id they must match. A root round without a run id (or a
+    /// terminal without one) falls back to the turn number. A child round
+    /// only joins a terminal of its own run. Among candidates, an exact
+    /// run-id match wins, then the first terminal after the round, then the
+    /// nearest one before it.
+    fn owner(&self, events: &[JournalEvent], round_idx: usize) -> Option<usize> {
+        let round = &events[round_idx];
+        let turn = round.turn?;
+        let nearest = |list: Option<&Vec<usize>>| {
+            let list = list?;
+            let after = list.partition_point(|&i| i <= round_idx);
+            list.get(after)
+                .or_else(|| after.checked_sub(1).and_then(|b| list.get(b)))
+                .copied()
         };
-        if better {
-            best = Some((exact, after, idx));
+        let child = is_child_round(round);
+        match run_id_of(round) {
+            Some(run) => nearest(self.by_run.get(&(turn, run))).or_else(|| {
+                (!child)
+                    .then(|| nearest(self.anonymous.get(&turn)))
+                    .flatten()
+            }),
+            None if child => None,
+            None => nearest(self.any.get(&turn)),
         }
     }
-    best.map(|(_, _, idx)| idx)
+}
+
+/// Non-empty per-call records embedded on an `llm_round`.
+fn round_calls(e: &JournalEvent) -> Option<&Vec<ToolCallRecord>> {
+    (e.event_type == JournalEventType::LlmRound)
+        .then_some(e.tool_calls.as_ref())
+        .flatten()
+        .filter(|c| !c.is_empty())
 }
 
 fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
@@ -258,51 +303,60 @@ fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
     // run identity and turn). Each terminal then prefers its own records,
     // falls back to its rounds' records, and takes the executed count from
     // `tool_count` when present. Rounds owned by no terminal (crash,
-    // interrupt, other runs) stay at their original position.
+    // interrupt, other runs) are counted on their own. The sequence keeps
+    // journal order: round records stay at their round's position, and a
+    // terminal's own records are placed at its first round (or at the
+    // terminal when it has none), so interleaved activity is not reordered.
     let mut out = ToolActivity {
         sequence: Vec::new(),
         executed: 0,
         complete: true,
     };
-    let round_calls = |e: &JournalEvent| -> Option<Vec<ToolCallRecord>> {
-        (e.event_type == JournalEventType::LlmRound)
-            .then(|| e.tool_calls.clone())
-            .flatten()
-            .filter(|c| !c.is_empty())
-    };
-    let mut owned: BTreeMap<usize, Vec<Vec<ToolCallRecord>>> = BTreeMap::new();
-    let mut unmatched = vec![false; events.len()];
+    let index = TerminalIndex::new(events);
+    // terminal index -> indices of the rounds it owns (journal order).
+    let mut owned: HashMap<usize, Vec<usize>> = HashMap::new();
+    // Sequence chunks keyed by the journal position they are emitted at.
+    let mut slots: BTreeMap<usize, &[ToolCallRecord]> = BTreeMap::new();
     for (idx, e) in events.iter().enumerate() {
         if let Some(calls) = round_calls(e) {
-            match owning_terminal(events, idx) {
-                Some(t) => owned.entry(t).or_default().push(calls),
-                None => unmatched[idx] = true,
+            match index.owner(events, idx) {
+                Some(t) => owned.entry(t).or_default().push(idx),
+                None => {
+                    out.executed = out.executed.saturating_add(executed_in(calls));
+                    slots.insert(idx, calls);
+                }
             }
         }
     }
     for (idx, e) in events.iter().enumerate() {
-        if unmatched[idx] {
-            if let Some(calls) = round_calls(e) {
-                out.executed = out.executed.saturating_add(executed_in(&calls));
-                out.sequence.extend(calls.iter().map(|c| c.name.clone()));
-            }
-        } else if is_terminal(e) {
-            let rounds = owned.remove(&idx).unwrap_or_default();
-            let chunks: Vec<Vec<ToolCallRecord>> =
-                match e.tool_calls.as_ref().filter(|c| !c.is_empty()) {
-                    Some(calls) => vec![calls.clone()],
-                    None => rounds,
-                };
-            let detailed: u64 = chunks.iter().map(|c| executed_in(c)).sum();
-            let executed = e.tool_count.map(u64::from).unwrap_or(detailed);
-            if detailed < executed {
-                out.complete = false;
-            }
-            out.executed = out.executed.saturating_add(executed);
-            out.sequence
-                .extend(chunks.iter().flat_map(|c| c.iter()).map(|r| r.name.clone()));
+        if !is_terminal(e) {
+            continue;
         }
+        let rounds = owned.remove(&idx).unwrap_or_default();
+        let detailed = match e.tool_calls.as_ref().filter(|c| !c.is_empty()) {
+            Some(calls) => {
+                slots.insert(rounds.first().map_or(idx, |&r| r.min(idx)), calls);
+                executed_in(calls)
+            }
+            None => rounds
+                .iter()
+                .filter_map(|&r| round_calls(&events[r]).map(|calls| (r, calls)))
+                .map(|(r, calls)| {
+                    slots.insert(r, calls);
+                    executed_in(calls)
+                })
+                .sum(),
+        };
+        let executed = e.tool_count.map(u64::from).unwrap_or(detailed);
+        if detailed < executed {
+            out.complete = false;
+        }
+        out.executed = out.executed.saturating_add(executed);
     }
+    out.sequence = slots
+        .into_values()
+        .flat_map(|c| c.iter().map(|r| r.name.clone()))
+        .collect();
     out
 }
 
@@ -657,6 +711,128 @@ mod tests {
         let d = diff_events("a", "b", &a, &[]);
         assert_eq!(d.a_tool_sequence, vec!["read_file", "bash"]);
         assert_eq!(d.a_tool_calls_executed, 2);
+    }
+
+    #[test]
+    fn matched_rounds_keep_their_position_among_unmatched_rounds() {
+        // Root round (turn 1), then a child round with its own producer
+        // scope and no turn, then the root terminal with only `tool_count`.
+        let a = vec![
+            rd(1, "root", "read_file"),
+            evt(json!({"type":"llm_round","ts":"t","session_id":"a",
+                "producer_scope":{"run_id":"child","parent_run_id":"root","agent_id":"worker"},
+                "tool_calls":[{"name":"grep","ok":true,"ms":0}]})),
+            evt(
+                json!({"type":"turn","ts":"t","session_id":"a","turn":1,"tool_count":1,
+                "metadata":{"run_id":"root"}}),
+            ),
+        ];
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_sequence, vec!["read_file", "grep"]);
+        assert_eq!(d.a_tool_calls_executed, 2);
+        assert!(d.a_tool_sequence_complete);
+        // Same shape when the terminal carries its own per-call detail.
+        let mut a = a;
+        a[2] = evt(
+            json!({"type":"turn","ts":"t","session_id":"a","turn":1,"tool_count":1,
+            "metadata":{"run_id":"root"},"tool_calls":[{"name":"read_file","ok":true,"ms":0}]}),
+        );
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_sequence, vec!["read_file", "grep"]);
+        assert_eq!(d.a_tool_calls_executed, 2);
+    }
+
+    #[test]
+    fn identified_child_round_is_not_folded_into_an_anonymous_terminal() {
+        let child = |purpose: bool, scope: bool| {
+            let mut v = json!({"type":"llm_round","ts":"t","session_id":"a","turn":1,
+                "tool_calls":[{"name":"grep","ok":true,"ms":0}]});
+            if scope {
+                v["producer_scope"] =
+                    json!({"run_id":"child","parent_run_id":"root","agent_id":"worker"});
+            }
+            if purpose {
+                v["metadata"] = json!({"purpose":"sub_agent"});
+            }
+            evt(v)
+        };
+        let terminal = evt(json!({"type":"turn","ts":"t","session_id":"a","turn":1,
+            "tool_count":1,"tool_calls":[{"name":"read_file","ok":true,"ms":0}]}));
+        for (purpose, scope) in [(true, true), (false, true), (true, false)] {
+            let a = vec![child(purpose, scope), terminal.clone()];
+            let d = diff_events("a", "b", &a, &[]);
+            assert_eq!(
+                d.a_tool_sequence,
+                vec!["grep", "read_file"],
+                "purpose={purpose} scope={scope}"
+            );
+            assert_eq!(d.a_tool_calls_executed, 2);
+            assert!(d.a_tool_sequence_complete);
+        }
+        // A root round without child identity still uses the legacy fallback.
+        let a = vec![rd(1, "root", "read_file"), terminal];
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_sequence, vec!["read_file"]);
+        assert_eq!(d.a_tool_calls_executed, 1);
+    }
+
+    #[test]
+    fn terminal_lookup_prefers_exact_run_then_nearest_following() {
+        let term = |turn: u32, run: Option<&str>, name: &str| {
+            let mut v = json!({"type":"turn","ts":"t","session_id":"a","turn":turn,
+                "tool_count":1,"tool_calls":[{"name":name,"ok":true,"ms":0}]});
+            if let Some(r) = run {
+                v["metadata"] = json!({"run_id": r});
+            }
+            evt(v)
+        };
+        // Exact run match before the round beats an anonymous terminal after it.
+        let a = vec![
+            term(1, Some("r1"), "t_exact"),
+            rd(1, "r1", "round"),
+            term(1, None, "t_anon"),
+        ];
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_sequence, vec!["t_exact", "t_anon"]);
+        assert_eq!(d.a_tool_calls_executed, 2);
+        // Without a run id, the first following terminal of that turn wins.
+        let a = vec![
+            term(1, Some("x"), "t_before"),
+            evt(
+                json!({"type":"llm_round","ts":"t","session_id":"a","turn":1,
+                "tool_calls":[{"name":"round","ok":true,"ms":0}]}),
+            ),
+            term(1, Some("y"), "t_after1"),
+            term(1, Some("z"), "t_after2"),
+        ];
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_sequence, vec!["t_before", "t_after1", "t_after2"]);
+        assert_eq!(d.a_tool_calls_executed, 3);
+    }
+
+    #[test]
+    fn activity_fold_scales_linearly_with_journal_size() {
+        // 8,000 turns x (1 round + 20 trace events + 1 terminal): the old
+        // per-round journal rescan took seconds here.
+        let mut a = Vec::new();
+        for turn in 1..=8000u32 {
+            a.push(rd(turn, "root", "read_file"));
+            for _ in 0..20 {
+                a.push(evt(
+                    json!({"type":"trace_span","ts":"t","session_id":"a","turn":turn}),
+                ));
+            }
+            a.push(evt(
+                json!({"type":"turn","ts":"t","session_id":"a","turn":turn,
+                "tool_count":1,"metadata":{"run_id":"root"}}),
+            ));
+        }
+        let start = std::time::Instant::now();
+        let d = diff_events("a", "b", &a, &[]);
+        let elapsed = start.elapsed();
+        assert_eq!(d.a_tool_calls_executed, 8000);
+        assert!(d.a_tool_sequence_complete);
+        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
     }
 
     #[test]
