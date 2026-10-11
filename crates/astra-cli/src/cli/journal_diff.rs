@@ -22,7 +22,9 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use astra_services::session_journal::{self, JournalEvent, JournalEventType};
+use astra_services::session_journal::{
+    self, JournalEvent, JournalEventType, ToolCallRecord, ToolOutcomeSummary,
+};
 
 use crate::cli::cli_config::cli_args;
 use crate::cli::journal_digest;
@@ -46,6 +48,16 @@ pub struct JournalDiff {
     /// level diff: "A called [Read, Grep, Read]; B called [Read, Read]".
     pub a_tool_sequence: Vec<String>,
     pub b_tool_sequence: Vec<String>,
+    /// Executed tool calls per run. Taken from each turn's authoritative
+    /// `tool_count` aggregate, so it stays correct when per-call detail
+    /// (`tool_calls`) was not recorded (e.g. server-owned CLI turns).
+    pub a_tool_calls_executed: u64,
+    pub b_tool_calls_executed: u64,
+    /// False when the run executed more calls than its per-call detail
+    /// covers; the sequence is then partial and must not be read as
+    /// the full call list.
+    pub a_tool_sequence_complete: bool,
+    pub b_tool_sequence_complete: bool,
     /// Aggregate token totals.
     pub a_tokens: TokenTotals,
     pub b_tokens: TokenTotals,
@@ -121,6 +133,9 @@ pub(crate) fn diff_events(
         total: saturating_delta(a_tokens.total, b_tokens.total),
     };
 
+    let a_tools = tool_activity(a_events);
+    let b_tools = tool_activity(b_events);
+
     JournalDiff {
         a_session: a_session.to_string(),
         b_session: b_session.to_string(),
@@ -129,8 +144,12 @@ pub(crate) fn diff_events(
         only_in_a,
         only_in_b,
         count_deltas,
-        a_tool_sequence: tool_sequence(a_events),
-        b_tool_sequence: tool_sequence(b_events),
+        a_tool_sequence: a_tools.sequence,
+        b_tool_sequence: b_tools.sequence,
+        a_tool_calls_executed: a_tools.executed,
+        b_tool_calls_executed: b_tools.executed,
+        a_tool_sequence_complete: a_tools.complete,
+        b_tool_sequence_complete: b_tools.complete,
         a_tokens,
         b_tokens,
         token_deltas,
@@ -170,21 +189,74 @@ fn token_totals(events: &[JournalEvent]) -> TokenTotals {
     t
 }
 
-fn tool_sequence(events: &[JournalEvent]) -> Vec<String> {
-    // Walk `JournalEvent.tool_calls` (set on Turn / LlmRound events) in
-    // journal order. The per-event vec preserves within-turn ordering;
-    // cross-event traversal preserves turn ordering. Union of both gives
-    // the full tool-call sequence a reviewer sees when reading the run
-    // top-to-bottom.
-    let mut out = Vec::new();
+struct ToolActivity {
+    sequence: Vec<String>,
+    executed: u64,
+    complete: bool,
+}
+
+fn executed_in(records: &[ToolCallRecord]) -> u64 {
+    u64::from(ToolOutcomeSummary::from_records(records).executed)
+}
+
+fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
+    // Per-call records can be embedded on each `llm_round` and again on
+    // the completed `turn` for the same calls, while server-owned turns
+    // carry only the aggregate `tool_count`. For each turn, prefer the
+    // turn-level records, fall back to that turn's round records, and
+    // take the executed count from `tool_count` when present.
+    let mut out = ToolActivity {
+        sequence: Vec::new(),
+        executed: 0,
+        complete: true,
+    };
+    let mut pending_rounds: Vec<(Option<u32>, &[ToolCallRecord])> = Vec::new();
     for e in events {
-        if let Some(calls) = e.tool_calls.as_ref() {
-            for c in calls {
-                out.push(c.name.clone());
+        match e.event_type {
+            JournalEventType::LlmRound => {
+                if let Some(calls) = e.tool_calls.as_deref().filter(|c| !c.is_empty()) {
+                    pending_rounds.push((e.turn, calls));
+                }
             }
+            JournalEventType::Turn => {
+                let (mine, rest): (Vec<_>, Vec<_>) =
+                    pending_rounds.into_iter().partition(|(t, _)| *t == e.turn);
+                pending_rounds = rest;
+                let chunks: Vec<&[ToolCallRecord]> =
+                    match e.tool_calls.as_deref().filter(|c| !c.is_empty()) {
+                        Some(calls) => vec![calls],
+                        None => mine.into_iter().map(|(_, c)| c).collect(),
+                    };
+                let detailed: u64 = chunks.iter().map(|c| executed_in(c)).sum();
+                let executed = e.tool_count.map(u64::from).unwrap_or(detailed);
+                if detailed < executed {
+                    out.complete = false;
+                }
+                out.executed = out.executed.saturating_add(executed);
+                out.sequence
+                    .extend(chunks.iter().flat_map(|c| c.iter()).map(|r| r.name.clone()));
+            }
+            _ => {}
         }
     }
+    // Rounds of a turn that never completed (crash / interrupt).
+    for (_, calls) in pending_rounds {
+        out.executed = out.executed.saturating_add(executed_in(calls));
+        out.sequence.extend(calls.iter().map(|c| c.name.clone()));
+    }
     out
+}
+
+fn render_tool_sequence(label: &str, seq: &[String], executed: u64, complete: bool) -> String {
+    if complete {
+        format!("tool sequence {label} ({} calls): {seq:?}\n", seq.len())
+    } else {
+        format!(
+            "tool sequence {label} ({executed} executed calls; detailed sequence \
+             unavailable/incomplete, {} recorded): {seq:?}\n",
+            seq.len()
+        )
+    }
 }
 
 fn has_final_text(events: &[JournalEvent]) -> bool {
@@ -269,18 +341,29 @@ pub fn render_text(diff: &JournalDiff) -> String {
     }
 
     s.push('\n');
-    s.push_str(&format!(
-        "tool sequence A ({} calls): {:?}\n",
-        diff.a_tool_sequence.len(),
-        diff.a_tool_sequence
+    s.push_str(&render_tool_sequence(
+        "A",
+        &diff.a_tool_sequence,
+        diff.a_tool_calls_executed,
+        diff.a_tool_sequence_complete,
     ));
-    s.push_str(&format!(
-        "tool sequence B ({} calls): {:?}\n",
-        diff.b_tool_sequence.len(),
-        diff.b_tool_sequence
+    s.push_str(&render_tool_sequence(
+        "B",
+        &diff.b_tool_sequence,
+        diff.b_tool_calls_executed,
+        diff.b_tool_sequence_complete,
     ));
-    if diff.a_tool_sequence != diff.b_tool_sequence {
-        s.push_str("  → tool sequence DIFFERS\n");
+    if diff.a_tool_sequence_complete && diff.b_tool_sequence_complete {
+        if diff.a_tool_sequence != diff.b_tool_sequence {
+            s.push_str("  → tool sequence DIFFERS\n");
+        }
+    } else if diff.a_tool_calls_executed != diff.b_tool_calls_executed {
+        s.push_str(&format!(
+            "  → executed tool-call count DIFFERS ({} → {}); sequences not comparable\n",
+            diff.a_tool_calls_executed, diff.b_tool_calls_executed
+        ));
+    } else {
+        s.push_str("  → sequences not comparable (detail incomplete)\n");
     }
 
     s
@@ -386,6 +469,86 @@ mod tests {
         let d = diff_events("a", "b", &a, &b);
         assert_eq!(d.a_tool_sequence, vec!["Read", "Grep"]);
         assert_eq!(d.b_tool_sequence, vec!["Grep", "Read"]);
+    }
+
+    #[test]
+    fn aggregate_only_turns_do_not_render_as_zero_calls() {
+        // Server-owned CLI turns record `tool_count` / `tools_used` /
+        // `tool_outcomes` but no per-call `tool_calls` detail (#784).
+        // Missing detail must not be reported as "0 calls".
+        let a = vec![
+            evt(json!({
+                "type":"turn","ts":"t1","session_id":"a","turn":1,"tool_count":6,
+                "tools_used":["bash","read"],
+                "tool_outcomes":{"requested":6,"executed":6,"succeeded":5,"failed":1,
+                    "rejected":0,"reused":0,"suppressed":0,"deferred":0}
+            })),
+            evt(json!({"type":"turn","ts":"t2","session_id":"a","turn":2,"tool_count":0})),
+        ];
+        let b = vec![evt(json!({
+            "type":"turn","ts":"t1","session_id":"b","turn":1,"tool_count":82
+        }))];
+        let d = diff_events("a", "b", &a, &b);
+        let txt = render_text(&d);
+        assert!(
+            !txt.contains("(0 calls)"),
+            "missing detail rendered as zero:\n{txt}"
+        );
+        assert!(txt.contains("6 executed"), "{txt}");
+        assert!(txt.contains("82 executed"), "{txt}");
+        assert!(txt.contains("unavailable"), "{txt}");
+    }
+
+    #[test]
+    fn round_and_turn_records_for_same_turn_are_not_double_counted() {
+        // Local runs embed per-call records on each llm_round AND on the
+        // completed turn; the sequence must list each call once.
+        let calls = json!([
+            {"name":"Read","ok":true,"ms":0},
+            {"name":"Grep","ok":true,"ms":0},
+        ]);
+        let a = vec![
+            evt(
+                json!({"type":"llm_round","ts":"t1","session_id":"a","turn":1,
+                "tool_calls":[{"name":"Read","ok":true,"ms":0}]}),
+            ),
+            evt(
+                json!({"type":"llm_round","ts":"t2","session_id":"a","turn":1,
+                "tool_calls":[{"name":"Grep","ok":true,"ms":0}]}),
+            ),
+            evt(json!({"type":"turn","ts":"t3","session_id":"a","turn":1,
+                "tool_count":2,"tool_calls":calls})),
+        ];
+        let d = diff_events("a", "a2", &a, &[]);
+        assert_eq!(d.a_tool_sequence, vec!["Read", "Grep"]);
+    }
+
+    #[test]
+    fn executed_count_and_completeness_are_exposed_in_json_fields() {
+        let a = vec![evt(json!({
+            "type":"turn","ts":"t","session_id":"a","turn":1,"tool_count":3,
+            "tool_calls":[{"name":"Read","ok":true,"ms":0}]
+        }))];
+        let b = vec![evt(
+            json!({"type":"turn","ts":"t","session_id":"b","turn":1,"tool_count":0}),
+        )];
+        let d = diff_events("a", "b", &a, &b);
+        assert_eq!(d.a_tool_calls_executed, 3);
+        assert!(
+            !d.a_tool_sequence_complete,
+            "1 record cannot cover 3 executed calls"
+        );
+        assert_eq!(d.b_tool_calls_executed, 0);
+        assert!(
+            d.b_tool_sequence_complete,
+            "a turn with no tool calls is complete"
+        );
+        let txt = render_text(&d);
+        assert!(txt.contains("tool sequence B (0 calls): []"), "{txt}");
+        assert!(
+            txt.contains("executed tool-call count DIFFERS (3 → 0)"),
+            "{txt}"
+        );
     }
 
     #[test]
