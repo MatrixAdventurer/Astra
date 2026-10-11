@@ -199,50 +199,109 @@ fn executed_in(records: &[ToolCallRecord]) -> u64 {
     u64::from(ToolOutcomeSummary::from_records(records).executed)
 }
 
+fn run_id_of(e: &JournalEvent) -> Option<&str> {
+    e.producer_scope
+        .as_ref()
+        .map(|scope| scope.run_id.as_str())
+        .or_else(|| e.metadata.as_ref()?.get("run_id")?.as_str())
+}
+
+fn is_terminal(e: &JournalEvent) -> bool {
+    matches!(
+        e.event_type,
+        JournalEventType::Turn | JournalEventType::TurnError
+    )
+}
+
+/// Index of the terminal (`turn` / `turn_error`) that owns the round at
+/// `round_idx`, searched over the whole snapshot: a round can be written
+/// after its terminal. A turn number alone does not identify an attempt,
+/// so when both sides carry a run id they must match; a round without a
+/// run id (or a terminal without one) falls back to the turn number.
+/// Among candidates, an exact run-id match wins, then the first terminal at
+/// or after the round, then the nearest one before it.
+fn owning_terminal(events: &[JournalEvent], round_idx: usize) -> Option<usize> {
+    let round = &events[round_idx];
+    let turn = round.turn?;
+    let round_run = run_id_of(round);
+    let mut best: Option<(bool, bool, usize)> = None;
+    for (idx, e) in events.iter().enumerate() {
+        if !is_terminal(e) || e.turn != Some(turn) {
+            continue;
+        }
+        let exact = match (round_run, run_id_of(e)) {
+            (Some(r), Some(t)) if r != t => continue,
+            (Some(_), Some(_)) => true,
+            _ => false,
+        };
+        let after = idx > round_idx;
+        let better = match best {
+            None => true,
+            Some((b_exact, b_after, b_idx)) => {
+                (exact, after) > (b_exact, b_after)
+                    || ((exact, after) == (b_exact, b_after)
+                        && if after { idx < b_idx } else { idx > b_idx })
+            }
+        };
+        if better {
+            best = Some((exact, after, idx));
+        }
+    }
+    best.map(|(_, _, idx)| idx)
+}
+
 fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
     // Per-call records can be embedded on each `llm_round` and again on
-    // the completed `turn` for the same calls, while server-owned turns
-    // carry only the aggregate `tool_count`. For each turn, prefer the
-    // turn-level records, fall back to that turn's round records, and
-    // take the executed count from `tool_count` when present.
+    // the terminal (`turn` / `turn_error`) for the same calls, while
+    // server-owned turns carry only the aggregate `tool_count`. Rounds are
+    // first associated with their terminal across the whole snapshot (by
+    // run identity and turn). Each terminal then prefers its own records,
+    // falls back to its rounds' records, and takes the executed count from
+    // `tool_count` when present. Rounds owned by no terminal (crash,
+    // interrupt, other runs) stay at their original position.
     let mut out = ToolActivity {
         sequence: Vec::new(),
         executed: 0,
         complete: true,
     };
-    let mut pending_rounds: Vec<(Option<u32>, &[ToolCallRecord])> = Vec::new();
-    for e in events {
-        match e.event_type {
-            JournalEventType::LlmRound => {
-                if let Some(calls) = e.tool_calls.as_deref().filter(|c| !c.is_empty()) {
-                    pending_rounds.push((e.turn, calls));
-                }
+    let round_calls = |e: &JournalEvent| -> Option<Vec<ToolCallRecord>> {
+        (e.event_type == JournalEventType::LlmRound)
+            .then(|| e.tool_calls.clone())
+            .flatten()
+            .filter(|c| !c.is_empty())
+    };
+    let mut owned: BTreeMap<usize, Vec<Vec<ToolCallRecord>>> = BTreeMap::new();
+    let mut unmatched = vec![false; events.len()];
+    for (idx, e) in events.iter().enumerate() {
+        if let Some(calls) = round_calls(e) {
+            match owning_terminal(events, idx) {
+                Some(t) => owned.entry(t).or_default().push(calls),
+                None => unmatched[idx] = true,
             }
-            JournalEventType::Turn => {
-                let (mine, rest): (Vec<_>, Vec<_>) =
-                    pending_rounds.into_iter().partition(|(t, _)| *t == e.turn);
-                pending_rounds = rest;
-                let chunks: Vec<&[ToolCallRecord]> =
-                    match e.tool_calls.as_deref().filter(|c| !c.is_empty()) {
-                        Some(calls) => vec![calls],
-                        None => mine.into_iter().map(|(_, c)| c).collect(),
-                    };
-                let detailed: u64 = chunks.iter().map(|c| executed_in(c)).sum();
-                let executed = e.tool_count.map(u64::from).unwrap_or(detailed);
-                if detailed < executed {
-                    out.complete = false;
-                }
-                out.executed = out.executed.saturating_add(executed);
-                out.sequence
-                    .extend(chunks.iter().flat_map(|c| c.iter()).map(|r| r.name.clone()));
-            }
-            _ => {}
         }
     }
-    // Rounds of a turn that never completed (crash / interrupt).
-    for (_, calls) in pending_rounds {
-        out.executed = out.executed.saturating_add(executed_in(calls));
-        out.sequence.extend(calls.iter().map(|c| c.name.clone()));
+    for (idx, e) in events.iter().enumerate() {
+        if unmatched[idx] {
+            if let Some(calls) = round_calls(e) {
+                out.executed = out.executed.saturating_add(executed_in(&calls));
+                out.sequence.extend(calls.iter().map(|c| c.name.clone()));
+            }
+        } else if is_terminal(e) {
+            let rounds = owned.remove(&idx).unwrap_or_default();
+            let chunks: Vec<Vec<ToolCallRecord>> =
+                match e.tool_calls.as_ref().filter(|c| !c.is_empty()) {
+                    Some(calls) => vec![calls.clone()],
+                    None => rounds,
+                };
+            let detailed: u64 = chunks.iter().map(|c| executed_in(c)).sum();
+            let executed = e.tool_count.map(u64::from).unwrap_or(detailed);
+            if detailed < executed {
+                out.complete = false;
+            }
+            out.executed = out.executed.saturating_add(executed);
+            out.sequence
+                .extend(chunks.iter().flat_map(|c| c.iter()).map(|r| r.name.clone()));
+        }
     }
     out
 }
@@ -521,6 +580,83 @@ mod tests {
         ];
         let d = diff_events("a", "a2", &a, &[]);
         assert_eq!(d.a_tool_sequence, vec!["Read", "Grep"]);
+    }
+
+    fn rd(turn: u32, run: &str, name: &str) -> JournalEvent {
+        evt(
+            json!({"type":"llm_round","ts":"t","session_id":"a","turn":turn,
+            "metadata":{"run_id":run},"tool_calls":[{"name":name,"ok":true,"ms":0}]}),
+        )
+    }
+
+    #[test]
+    fn failed_turns_are_included_in_the_activity_fold() {
+        let a = vec![evt(
+            json!({"type":"turn_error","ts":"t","session_id":"a","turn":1,
+            "tool_calls":[{"name":"read_file","ok":true,"ms":0}]}),
+        )];
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_sequence, vec!["read_file"]);
+        let a = vec![evt(
+            json!({"type":"turn_error","ts":"t","session_id":"a","turn":1,"tool_count":6}),
+        )];
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_calls_executed, 6);
+        assert!(!d.a_tool_sequence_complete);
+    }
+
+    #[test]
+    fn rounds_of_another_run_with_the_same_turn_are_kept() {
+        let a = vec![
+            rd(1, "run-a", "read_file"),
+            evt(
+                json!({"type":"turn","ts":"t","session_id":"a","turn":1,"tool_count":1,
+                "metadata":{"run_id":"run-b"},"tool_calls":[{"name":"bash","ok":true,"ms":0}]}),
+            ),
+        ];
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_sequence, vec!["read_file", "bash"]);
+        assert_eq!(d.a_tool_calls_executed, 2);
+    }
+
+    #[test]
+    fn rounds_written_after_their_terminal_are_not_counted_twice() {
+        let a = vec![
+            evt(
+                json!({"type":"turn","ts":"t","session_id":"a","turn":1,"tool_count":1,
+                "metadata":{"run_id":"r1"}}),
+            ),
+            rd(1, "r1", "read_file"),
+        ];
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_sequence, vec!["read_file"]);
+        assert_eq!(d.a_tool_calls_executed, 1);
+        assert!(d.a_tool_sequence_complete);
+        // terminal also carries the detail: listed once
+        let a = vec![
+            evt(
+                json!({"type":"turn","ts":"t","session_id":"a","turn":1,"tool_count":1,
+                "metadata":{"run_id":"r1"},"tool_calls":[{"name":"read_file","ok":true,"ms":0}]}),
+            ),
+            rd(1, "r1", "read_file"),
+        ];
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_sequence, vec!["read_file"]);
+        assert_eq!(d.a_tool_calls_executed, 1);
+    }
+
+    #[test]
+    fn unmatched_rounds_keep_their_chronological_position() {
+        let a = vec![
+            rd(1, "r1", "read_file"),
+            evt(
+                json!({"type":"turn","ts":"t","session_id":"a","turn":2,"tool_count":1,
+                "metadata":{"run_id":"r2"},"tool_calls":[{"name":"bash","ok":true,"ms":0}]}),
+            ),
+        ];
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_sequence, vec!["read_file", "bash"]);
+        assert_eq!(d.a_tool_calls_executed, 2);
     }
 
     #[test]
