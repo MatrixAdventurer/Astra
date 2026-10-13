@@ -38,7 +38,8 @@ jobs:
       - name: Focused regressions
         run: cargo test --locked -p astra-cli --lib grid_represents_ -- --nocapture
       - name: Full context panel tests
-        run: cargo test --locked -p astra-cli --lib tui::context_panel:: -- --nocapture
+        run: |
+          cargo test --locked -p astra-cli --lib tui::context_panel:: -- --nocapture
       - name: Repository metadata and CI contracts
         run: |
           python3 scripts/ci/validate_repository.py
