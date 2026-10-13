@@ -442,6 +442,7 @@ pub(crate) enum CategoryKind {
     Memory,
     History,
     UserMessage,
+    Unattributed,
 }
 
 impl CategoryKind {
@@ -452,6 +453,7 @@ impl CategoryKind {
             Self::Memory => "Memory",
             Self::History => "History",
             Self::UserMessage => "Current turn",
+            Self::Unattributed => "Unattributed",
         }
     }
 
@@ -463,6 +465,7 @@ impl CategoryKind {
             Self::Memory => theme.quote,
             Self::History => theme.warn,
             Self::UserMessage => theme.success,
+            Self::Unattributed => theme.warn,
         }
     }
 }
@@ -811,7 +814,8 @@ impl ContextBreakdown {
             (CategoryKind::History, budget.history_tokens),
             (CategoryKind::UserMessage, budget.user_message_tokens),
         ];
-        let categories: Vec<Category> = raw
+        let attributed: u64 = raw.iter().map(|(_, tokens)| u64::from(*tokens)).sum();
+        let mut categories: Vec<Category> = raw
             .into_iter()
             .filter(|(_, t)| *t > 0)
             .map(|(kind, tokens)| Category {
@@ -820,6 +824,17 @@ impl ContextBreakdown {
                 pct_of_limit: pct(tokens),
             })
             .collect();
+
+        // Provider-reported usage can exceed the estimated category breakdown.
+        // Keep that occupied context explicit instead of presenting it as free.
+        let unattributed = u64::from(budget.total_used).saturating_sub(attributed) as u32;
+        if unattributed > 0 {
+            categories.push(Category {
+                kind: CategoryKind::Unattributed,
+                tokens: unattributed,
+                pct_of_limit: pct(unattributed),
+            });
+        }
 
         let free_space_tokens = limit.saturating_sub(budget.total_used);
 
