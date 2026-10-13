@@ -1,0 +1,77 @@
+name: Verify context occupancy 783
+# 由 LW 授权的 ChatGPT Personal 智能体提交。
+on:
+  push:
+    branches: [verify/context-783]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: ./.github/actions/rust-setup
+        with:
+          shared-key: context-783
+          save-cache: "true"
+      - name: Reproduce baseline
+        shell: bash
+        run: |
+          git show 2873a950f2c9fea00343757933e96070d1631596:crates/astra-cli/src/tui/context_panel/model.rs > crates/astra-cli/src/tui/context_panel/model.rs
+          set +e
+          cargo test --locked -p astra-cli --lib grid_represents_ -- --nocapture 2>&1 | tee baseline.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q 'grid_represents_provider_usage_missing_from_category_estimates .*FAILED' baseline.log
+          grep -q 'grid_represents_usage_without_any_category_estimates .*FAILED' baseline.log
+          git restore --source=HEAD -- crates/astra-cli/src/tui/context_panel/model.rs
+      - name: Format candidate
+        run: cargo fmt --all
+      - name: Focused regressions
+        run: cargo test --locked -p astra-cli --lib grid_represents_ -- --nocapture
+      - name: Full context panel tests
+        run: cargo test --locked -p astra-cli --lib tui::context_panel:: -- --nocapture
+      - name: Repository metadata and CI contracts
+        run: |
+          python3 scripts/ci/validate_repository.py
+          python3 -m unittest discover -s scripts/ci -p 'test_*.py'
+      - name: Rust static gates
+        run: |
+          make lint
+          make format-check
+      - name: Full CLI inventory
+        run: |
+          cargo build --locked -p astra-cli --bin mock_mcp_server
+          cargo nextest run --locked -p astra-cli --lib --bins --profile ci
+      - name: Preserve candidate and evidence
+        if: always()
+        run: |
+          mkdir -p evidence/crates/astra-cli/src/tui/context_panel
+          cp crates/astra-cli/src/tui/context_panel/model.rs crates/astra-cli/src/tui/context_panel/view.rs evidence/crates/astra-cli/src/tui/context_panel/
+          git diff 2873a950f2c9fea00343757933e96070d1631596 --binary -- crates/astra-cli/src/tui/context_panel > evidence/fix.patch
+          git diff 2873a950f2c9fea00343757933e96070d1631596 --numstat -- crates/astra-cli/src/tui/context_panel > evidence/numstat.txt
+          cp baseline.log evidence/
+          git rev-parse HEAD > evidence/validation-commit.txt
+          sha256sum crates/astra-cli/src/tui/context_panel/model.rs crates/astra-cli/src/tui/context_panel/view.rs > evidence/sha256.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: context-783-evidence
+          path: evidence
+  docker-dependencies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Validate native dependency inputs
+        run: docker build --target dependency-inputs .
