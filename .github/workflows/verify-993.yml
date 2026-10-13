@@ -1,0 +1,89 @@
+name: Verify quinn security dependency
+# 由 LW 授权的 ChatGPT Personal 智能体提交。
+on:
+  push:
+    branches: [verify/993-quinn-audit]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: '0'
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/rust-setup
+        with:
+          shared-key: quinn-security-993
+          save-cache: 'true'
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29
+        with:
+          tool: cargo-audit@0.22.1
+      - name: Fixed advisory database and clean baseline failure
+        run: |
+          set -euo pipefail
+          mkdir evidence
+          git clone --depth 1 https://github.com/RustSec/advisory-db "$HOME/.cargo/advisory-db"
+          git -C "$HOME/.cargo/advisory-db" rev-parse HEAD > evidence/advisory-db-sha.txt
+          status=0
+          make audit > evidence/baseline-audit.log 2>&1 || status=$?
+          cat evidence/baseline-audit.log
+          test "$status" -ne 0
+          grep -F '5 vulnerabilities found' evidence/baseline-audit.log
+          grep -F 'RUSTSEC-2026-0340' evidence/baseline-audit.log
+          grep -F 'RUSTSEC-2026-0338' evidence/baseline-audit.log
+          grep -F 'RUSTSEC-2026-0341' evidence/baseline-audit.log
+          grep -F 'RUSTSEC-2026-0339' evidence/baseline-audit.log
+          grep -F 'RUSTSEC-2026-0342' evidence/baseline-audit.log
+      - name: Generate lockfile through Cargo
+        run: |
+          set -euo pipefail
+          cargo update -p quinn-proto --precise 0.11.18
+          sha256sum Cargo.lock > evidence/generated-lock-sha256.txt
+          git diff --check
+          git diff --numstat -- Cargo.lock > evidence/numstat.txt
+          git diff -- Cargo.lock > evidence/candidate.patch
+          test "$(git diff --name-only | wc -l)" -eq 1
+          test "$(git diff --name-only)" = Cargo.lock
+          python3 -c 's=sum(sum(map(int,x.split()[:2])) for x in open("evidence/numstat.txt")); assert s<=1000, s'
+      - name: Fixed dependency audit
+        run: |
+          set -euo pipefail
+          make audit 2>&1 | tee evidence/fixed-audit.log
+          test "$(git -C "$HOME/.cargo/advisory-db" rev-parse HEAD)" = "$(cat evidence/advisory-db-sha.txt)"
+      - name: Repository gates and consumers
+        run: |
+          set -euo pipefail
+          make format-check
+          make lint
+          make check
+          make test-offline
+          make test-contract
+      - name: Final delivery boundary
+        run: |
+          set -euo pipefail
+          sha256sum --check evidence/generated-lock-sha256.txt
+          git diff --check
+          test "$(git diff --name-only | wc -l)" -eq 1
+          test "$(git diff --name-only)" = Cargo.lock
+          git diff --numstat > evidence/final-numstat.txt
+          python3 -c 's=sum(sum(map(int,x.split()[:2])) for x in open("evidence/final-numstat.txt")); assert s<=1000, s'
+      - name: Preserve generated candidate
+        if: always()
+        run: |
+          mkdir -p evidence
+          cp Cargo.lock evidence/Cargo.lock
+          git diff -- Cargo.lock > evidence/candidate.patch
+          git diff --numstat -- Cargo.lock > evidence/numstat.txt
+          git rev-parse HEAD > evidence/verification-head.txt
+          sha256sum Cargo.lock > evidence/sha256.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: quinn-993-evidence
+          path: evidence
