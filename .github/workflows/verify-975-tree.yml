@@ -1,0 +1,58 @@
+name: Verify journal tree root tool counts
+on:
+  push:
+    branches: [verify/975-tree-tools-20261015]
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: ./.github/actions/rust-setup
+        with:
+          shared-key: cli
+          install-nextest: 'false'
+      - name: Save candidate and inject regression into actual main implementation
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cp crates/astra-cli/src/cli/journal_tree.rs evidence/candidate.rs
+          git show 89dcde88f25d9de9ac91752365ca814ddeff626e:crates/astra-cli/src/cli/journal_tree.rs > evidence/baseline.rs
+          python3 - <<'PY'
+          from pathlib import Path
+          candidate = Path("evidence/candidate.rs").read_text()
+          tests = candidate[candidate.index("    #[test]\n    fn tree_counts_root_executions_once"):candidate.rfind("}")]
+          baseline = Path("evidence/baseline.rs").read_text()
+          Path("crates/astra-cli/src/cli/journal_tree.rs").write_text(baseline[:baseline.rfind("}")] + tests + "}\n")
+          PY
+      - name: Verify red regressions against unfixed production code
+        run: |
+          set -euo pipefail
+          set +e
+          cargo test --locked -p astra-cli --lib tree_counts_ -- --nocapture 2>&1 | tee evidence/red.log
+          result=${PIPESTATUS[0]}
+          set -e
+          test "$result" -ne 0
+          grep -F 'test result: FAILED. 0 passed; 3 failed;' evidence/red.log
+      - name: Verify fixed regression and complete CLI unit inventory
+        run: |
+          set -euo pipefail
+          cp evidence/candidate.rs crates/astra-cli/src/cli/journal_tree.rs
+          cargo fmt --all
+          cp crates/astra-cli/src/cli/journal_tree.rs evidence/formatted.rs
+          cargo test --locked -p astra-cli --lib journal_tree -- --nocapture 2>&1 | tee evidence/green.log
+          cargo test --locked -p astra-cli --lib 2>&1 | tee evidence/cli.log
+          cargo clippy --locked -p astra-cli --all-targets -- -D warnings 2>&1 | tee evidence/clippy.log
+          git diff --check
+          git diff --stat > evidence/stat.txt
+      - name: Retain actual source and evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: tree-tools-evidence
+          path: evidence
