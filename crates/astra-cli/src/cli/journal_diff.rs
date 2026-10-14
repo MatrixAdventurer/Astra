@@ -289,7 +289,7 @@ impl<'a> TerminalIndex<'a> {
 
 /// Non-empty per-call records embedded on an `llm_round`.
 fn round_calls(e: &JournalEvent) -> Option<&Vec<ToolCallRecord>> {
-    (e.event_type == JournalEventType::LlmRound)
+    matches!(e.event_type, JournalEventType::LlmRound | JournalEventType::ToolCallError)
         .then_some(e.tool_calls.as_ref())
         .flatten()
         .filter(|c| !c.is_empty())
@@ -316,14 +316,22 @@ fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
     // terminal index -> indices of the rounds it owns (journal order).
     let mut owned: HashMap<usize, Vec<usize>> = HashMap::new();
     // Sequence chunks keyed by the journal position they are emitted at.
-    let mut slots: BTreeMap<usize, &[ToolCallRecord]> = BTreeMap::new();
+    let mut slots: BTreeMap<(usize, usize, usize), &ToolCallRecord> = BTreeMap::new();
+    let mut orphan_ids = std::collections::HashSet::new();
     for (idx, e) in events.iter().enumerate() {
         if let Some(calls) = round_calls(e) {
             match index.owner(events, idx) {
                 Some(t) => owned.entry(t).or_default().push(idx),
                 None => {
-                    out.executed = out.executed.saturating_add(executed_in(calls));
-                    slots.insert(idx, calls);
+                    for (offset, call) in calls.iter().enumerate() {
+                        if call.tool_call_id.as_deref().is_some_and(|id| {
+                            !orphan_ids.insert((e.turn, run_id_of(e), id))
+                        }) {
+                            continue;
+                        }
+                        out.executed = out.executed.saturating_add(executed_in(std::slice::from_ref(call)));
+                        slots.insert((idx, offset, 0), call);
+                    }
                 }
             }
         }
@@ -333,29 +341,69 @@ fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
             continue;
         }
         let rounds = owned.remove(&idx).unwrap_or_default();
-        let detailed = match e.tool_calls.as_ref().filter(|c| !c.is_empty()) {
-            Some(calls) => {
-                slots.insert(rounds.first().map_or(idx, |&r| r.min(idx)), calls);
-                executed_in(calls)
+        let mut locations = HashMap::new();
+        let mut round_locations = HashMap::new();
+        for &r in &rounds {
+            for (offset, call) in round_calls(&events[r]).into_iter().flatten().enumerate() {
+                if let Some(id) = call.tool_call_id.as_deref() {
+                    locations.entry(id).or_insert((r, offset));
+                }
+                if events[r].event_type == JournalEventType::LlmRound {
+                    if let Some(round) = call.round {
+                        round_locations.entry(round).or_insert(r);
+                    }
+                }
             }
-            None => rounds
-                .iter()
-                .filter_map(|&r| round_calls(&events[r]).map(|calls| (r, calls)))
-                .map(|(r, calls)| {
-                    slots.insert(r, calls);
-                    executed_in(calls)
-                })
-                .sum(),
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut detailed = match e.tool_calls.as_ref().filter(|c| !c.is_empty()) {
+            Some(calls) => {
+                let mut count = 0;
+                for (offset, call) in calls.iter().enumerate() {
+                    if call.tool_call_id.as_deref().is_some_and(|id| !seen.insert(id)) {
+                        continue;
+                    }
+                    let (position, within) = call.tool_call_id.as_deref()
+                        .and_then(|id| locations.get(id).copied())
+                        .or_else(|| call.round.and_then(|round| round_locations.get(&round).map(|&r| (r, offset))))
+                        .unwrap_or((if call.tool_call_id.is_some() {
+                            idx
+                        } else {
+                            rounds.iter().copied()
+                                .find(|&r| events[r].event_type == JournalEventType::LlmRound)
+                                .map_or(idx, |r| r.min(idx))
+                        }, offset));
+                    slots.insert((position, within, offset + 1), call);
+                    count += executed_in(std::slice::from_ref(call));
+                }
+                count
+            }
+            None => 0,
         };
+        let terminal_detail = e.tool_calls.as_ref().is_some_and(|c| !c.is_empty());
+        for &r in &rounds {
+            // Complete terminal records supersede legacy round projections,
+            // but a standalone failure remains evidence unless its ID is covered.
+            if terminal_detail && events[r].event_type != JournalEventType::ToolCallError {
+                continue;
+            }
+            for (offset, call) in round_calls(&events[r]).into_iter().flatten().enumerate() {
+                if call.tool_call_id.as_deref().is_some_and(|id| !seen.insert(id)) {
+                    continue;
+                }
+                slots.insert((r, offset, 0), call);
+                detailed += executed_in(std::slice::from_ref(call));
+            }
+        }
         let executed = e.tool_count.map(u64::from).unwrap_or(detailed);
-        if detailed < executed {
+        if detailed != executed {
             out.complete = false;
         }
         out.executed = out.executed.saturating_add(executed);
     }
     out.sequence = slots
         .into_values()
-        .flat_map(|c| c.iter().map(|r| r.name.clone()))
+        .map(|r| r.name.clone())
         .collect();
     out
 }
@@ -808,6 +856,78 @@ mod tests {
         let d = diff_events("a", "b", &a, &[]);
         assert_eq!(d.a_tool_sequence, vec!["t_before", "t_after1", "t_after2"]);
         assert_eq!(d.a_tool_calls_executed, 3);
+    }
+
+    #[test]
+    fn review_followup_terminal_detail_preserves_interleaved_rounds() {
+        let call = |id: &str, name: &str, round: u32| {
+            json!({"tool_call_id":id,"name":name,"ok":true,"ms":0,"round":round})
+        };
+        let mut a = vec![
+            evt(json!({"type":"llm_round","ts":"t","session_id":"a","turn":1,
+                "metadata":{"run_id":"root"},"tool_calls":[call("a", "read_file", 0)]})),
+            evt(json!({"type":"llm_round","ts":"t","session_id":"a",
+                "producer_scope":{"run_id":"child","parent_run_id":"root","agent_id":"worker"},
+                "tool_calls":[call("c", "grep", 0)]})),
+            evt(json!({"type":"llm_round","ts":"t","session_id":"a","turn":1,
+                "metadata":{"run_id":"root"},"tool_calls":[call("b", "bash", 1)]})),
+            evt(json!({"type":"turn","ts":"t","session_id":"a","turn":1,
+                "metadata":{"run_id":"root"},"tool_count":2,
+                "tool_calls":[call("a", "read_file", 0),call("b", "bash", 1)]})),
+        ];
+        let mut b = a.clone();
+        b[3].tool_calls = None;
+        let d = diff_events("a", "b", &a, &b);
+        assert_eq!(d.a_tool_sequence, vec!["read_file", "grep", "bash"]);
+        assert_eq!(d.a_tool_sequence, d.b_tool_sequence);
+        assert_eq!(d.a_tool_calls_executed, 3);
+        assert!(d.a_tool_sequence_complete);
+        assert!(!render_text(&d).contains("tool sequence DIFFERS"));
+        // Round attribution also preserves order in older records without IDs.
+        for e in &mut a {
+            if let Some(calls) = e.tool_calls.as_mut() {
+                for c in calls {
+                    c.tool_call_id = None;
+                }
+            }
+        }
+        let d = diff_events("a", "b", &a, &b);
+        assert_eq!(d.a_tool_sequence, d.b_tool_sequence);
+    }
+
+    #[test]
+    fn review_followup_standalone_error_is_retained_and_deduplicated() {
+        let failed = json!({"tool_call_id":"failed","name":"bash","ok":false,
+            "ms":1,"error":"failed","round":0});
+        let error = evt(json!({"type":"tool_call_error","ts":"t","session_id":"a",
+            "turn":1,"metadata":{"run_id":"root"},"tool_calls":[failed.clone()]}));
+        let round = evt(json!({"type":"llm_round","ts":"t","session_id":"a",
+            "turn":1,"metadata":{"run_id":"root"},"tool_calls":[failed.clone()]}));
+        let terminal = evt(json!({"type":"turn_error","ts":"t","session_id":"a",
+            "turn":1,"metadata":{"run_id":"root"},"tool_count":1,"tool_calls":[failed]}));
+        for a in [vec![error.clone()], vec![error.clone(), round.clone()],
+            vec![error.clone(), round.clone(), terminal.clone()], vec![error, terminal]] {
+            let d = diff_events("a", "b", &a, &[]);
+            assert_eq!(d.a_tool_sequence, vec!["bash"]);
+            assert_eq!(d.a_tool_calls_executed, 1);
+            assert!(d.a_tool_sequence_complete);
+        }
+    }
+
+    #[test]
+    fn review_followup_partial_terminal_does_not_overwrite_error() {
+        let a = vec![
+            evt(json!({"type":"tool_call_error","ts":"t","session_id":"a","turn":1,
+                "metadata":{"run_id":"root"},"tool_calls":[
+                    {"tool_call_id":"f","name":"bash","ok":false,"ms":0}]})),
+            evt(json!({"type":"turn","ts":"t","session_id":"a","turn":1,
+                "metadata":{"run_id":"root"},"tool_count":2,"tool_calls":[
+                    {"tool_call_id":"s","name":"read_file","ok":true,"ms":0}]})),
+        ];
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_sequence, vec!["bash", "read_file"]);
+        assert_eq!(d.a_tool_calls_executed, 2);
+        assert!(d.a_tool_sequence_complete);
     }
 
     #[test]
