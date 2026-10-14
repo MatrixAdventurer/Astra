@@ -1,47 +1,28 @@
-name: Verify journal diff review fixes
+name: Verify journal diff production error identity
 on:
   push:
-    branches: [verify/974-review-followup-20261014-candidate]
+    branches: [verify/974-production-error-identity-20261014]
 permissions:
   contents: read
 jobs:
-  regression-and-cli:
+  production-error-regression:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 45
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - uses: ./.github/actions/rust-setup
         with:
           shared-key: journal-review-followup
           save-cache: 'true'
-      - name: Format and focused regressions
+          install-nextest: 'false'
+      - name: Exercise production event shape against prior candidate
         run: |
           git rev-parse HEAD
           rustc --version
-          cargo fmt --all
-          cargo fmt --all -- --check
-          cargo test --locked -p astra-cli --lib journal_diff -- --nocapture
-      - name: Full CLI inventory
-        run: |
-          cargo build --locked -p astra-cli --bin mock_mcp_server
-          cargo nextest run --locked -p astra-cli --lib --bins --profile ci
-      - name: CLI clippy
-        run: cargo clippy --locked -p astra-cli --all-targets -- -D warnings
-      - name: Retain formatted source and patch
-        if: always()
-        run: |
-          mkdir -p verification-evidence
-          cp crates/astra-cli/src/cli/journal_diff.rs verification-evidence/
-          git diff > verification-evidence/formatting.patch
-          git rev-parse HEAD > verification-evidence/commit.txt
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: journal-review-followup-evidence
-          path: verification-evidence
+          cargo test --locked -p astra-cli --lib review_followup_production_error_without_run_id_is_not_counted_twice -- --nocapture
