@@ -76,6 +76,15 @@ checkpoints, correction timeline and exported owner identity; ingestion metadata
 does not select a storage partition. Debug retains the CLI authentication check
 but does not discover skill catalogs or connect MCP providers.
 
+`journal diff` reports known executed tool calls from terminal `tool_count`,
+with unowned per-call execution evidence retained separately. Its ordered tool
+sequence includes executed records only; rejected, reused, suppressed and
+deferred records are not executions. Aggregate-only turns and unresolved
+executed errors make the sequence incomplete. An unscoped standalone error
+requires a unique call/run witness to join a terminal: a reused turn number is
+not proof of ownership. Without that witness, retained evidence does not certify
+that it is disjoint from all terminal aggregates, and completeness remains false.
+
 Legacy `llm_round` records without `session_id` can inherit a file's session
 only when that same authorized source contains an explicit matching session ID
 in the inspected records.
