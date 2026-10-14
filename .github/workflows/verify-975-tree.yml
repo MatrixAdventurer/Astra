@@ -1,7 +1,7 @@
 name: Verify journal tree root tool counts
 on:
   push:
-    branches: [verify/975-tree-baseline-export-20261015]
+    branches: [verify/975-tree-mcp-fixture-20261015]
 permissions:
   contents: read
 jobs:
@@ -47,6 +47,7 @@ jobs:
           cargo fmt --all
           cp crates/astra-cli/src/cli/journal_tree.rs evidence/formatted.rs
           cargo test --locked -p astra-cli --lib journal_tree -- --nocapture 2>&1 | tee evidence/green.log
+          cargo build --locked -p astra-cli --bin mock_mcp_server 2>&1 | tee evidence/mock-build.log
           cargo test --locked -p astra-cli --lib 2>&1 | tee evidence/cli.log
           cargo clippy --locked -p astra-cli --all-targets -- -D warnings 2>&1 | tee evidence/clippy.log
           git diff --check
