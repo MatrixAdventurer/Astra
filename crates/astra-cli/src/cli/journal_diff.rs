@@ -861,13 +861,13 @@ mod tests {
 
     #[test]
     fn review_followup_production_error_without_run_id_is_not_counted_twice() {
-        let record: ToolCallRecord = serde_json::from_value(json!({
+        let record: super::ToolCallRecord = serde_json::from_value(json!({
             "tool_call_id":"failed-bash","name":"bash","round":0,
             "ok":false,"ms":1,"error":"exit 1"
         })).unwrap();
         // Use the production constructor: ToolCallError has no run identity.
         let error = JournalEvent::tool_call_error(Some("a"), 1, "bash", "exit 1", record.clone());
-        assert!(run_id_of(&error).is_none());
+        assert!(super::run_id_of(&error).is_none());
         let round = evt(json!({"type":"llm_round","ts":"t","session_id":"a","turn":1,
             "producer_scope":{"run_id":"root"},"tool_calls":[record]}));
         for events in [vec![error.clone(), round.clone()], vec![round, error]] {
