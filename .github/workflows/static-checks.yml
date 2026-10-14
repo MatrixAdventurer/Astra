@@ -1,11 +1,11 @@
-name: Static Checks
+name: Verify 974 refreshed main Static Checks
 
 permissions:
   contents: read
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, verify/974-refreshed-main-20261015]
   pull_request:
     branches: [main, develop]
 
@@ -37,7 +37,7 @@ jobs:
           persist-credentials: false
       - name: Classify changed paths
         id: scope
-        run: python3 scripts/ci/ci_scope.py
+        run: python3 scripts/ci/ci_scope.py crates/astra-cli/src/cli/journal_diff.rs
 
   docker-dependencies:
     name: Validate Docker dependency inputs

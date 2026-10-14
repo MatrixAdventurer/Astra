@@ -1,11 +1,11 @@
-name: Test Suite
+name: Verify 974 refreshed main Test Suite
 
 permissions:
   contents: read
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, verify/974-refreshed-main-20261015]
   pull_request:
     branches: [main, develop]
 
@@ -38,7 +38,7 @@ jobs:
           persist-credentials: false
       - name: Classify changed paths
         id: scope
-        run: python3 scripts/ci/ci_scope.py
+        run: python3 scripts/ci/ci_scope.py crates/astra-cli/src/cli/journal_diff.rs
 
   # Package groups remain parallel. CLI builds and executes its full inventory
   # once; stable protected labels require that same completed test result.
