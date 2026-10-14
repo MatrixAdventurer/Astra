@@ -811,6 +811,62 @@ mod tests {
     }
 
     #[test]
+    fn review_followup_terminal_detail_preserves_interleaved_rounds() {
+        let call = |id: &str, name: &str, round: u32| {
+            json!({"tool_call_id":id,"name":name,"ok":true,"ms":0,"round":round})
+        };
+        let mut a = vec![
+            evt(json!({"type":"llm_round","ts":"t","session_id":"a","turn":1,
+                "metadata":{"run_id":"root"},"tool_calls":[call("a", "read_file", 0)]})),
+            evt(json!({"type":"llm_round","ts":"t","session_id":"a",
+                "producer_scope":{"run_id":"child","parent_run_id":"root","agent_id":"worker"},
+                "tool_calls":[call("c", "grep", 0)]})),
+            evt(json!({"type":"llm_round","ts":"t","session_id":"a","turn":1,
+                "metadata":{"run_id":"root"},"tool_calls":[call("b", "bash", 1)]})),
+            evt(json!({"type":"turn","ts":"t","session_id":"a","turn":1,
+                "metadata":{"run_id":"root"},"tool_count":2,
+                "tool_calls":[call("a", "read_file", 0),call("b", "bash", 1)]})),
+        ];
+        let mut b = a.clone();
+        b[3].tool_calls = None;
+        let d = diff_events("a", "b", &a, &b);
+        assert_eq!(d.a_tool_sequence, vec!["read_file", "grep", "bash"]);
+        assert_eq!(d.a_tool_sequence, d.b_tool_sequence);
+        assert_eq!(d.a_tool_calls_executed, 3);
+        assert!(d.a_tool_sequence_complete);
+        assert!(!render_text(&d).contains("tool sequence DIFFERS"));
+        // Round attribution also preserves order in older records without IDs.
+        for e in &mut a {
+            if let Some(calls) = e.tool_calls.as_mut() {
+                for c in calls {
+                    c.tool_call_id = None;
+                }
+            }
+        }
+        let d = diff_events("a", "b", &a, &b);
+        assert_eq!(d.a_tool_sequence, d.b_tool_sequence);
+    }
+
+    #[test]
+    fn review_followup_standalone_error_is_retained_and_deduplicated() {
+        let failed = json!({"tool_call_id":"failed","name":"bash","ok":false,
+            "ms":1,"error":"failed","round":0});
+        let error = evt(json!({"type":"tool_call_error","ts":"t","session_id":"a",
+            "turn":1,"metadata":{"run_id":"root"},"tool_calls":[failed.clone()]}));
+        let round = evt(json!({"type":"llm_round","ts":"t","session_id":"a",
+            "turn":1,"metadata":{"run_id":"root"},"tool_calls":[failed.clone()]}));
+        let terminal = evt(json!({"type":"turn_error","ts":"t","session_id":"a",
+            "turn":1,"metadata":{"run_id":"root"},"tool_count":1,"tool_calls":[failed]}));
+        for a in [vec![error.clone()], vec![error.clone(), round.clone()],
+            vec![error.clone(), round.clone(), terminal.clone()], vec![error, terminal]] {
+            let d = diff_events("a", "b", &a, &[]);
+            assert_eq!(d.a_tool_sequence, vec!["bash"]);
+            assert_eq!(d.a_tool_calls_executed, 1);
+            assert!(d.a_tool_sequence_complete);
+        }
+    }
+
+    #[test]
     fn activity_fold_scales_linearly_with_journal_size() {
         // 8,000 turns x (1 round + 20 trace events + 1 terminal): the old
         // per-round journal rescan took seconds here.
