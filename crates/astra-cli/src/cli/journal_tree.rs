@@ -137,7 +137,8 @@ pub(crate) fn fold_events_into_tree(
             ev.event_type,
             JournalEventType::Turn | JournalEventType::TurnError
         ) && ev.producer_scope.as_ref().is_none_or(|scope| {
-            scope.parent_run_id.is_none() && scope.agent_id.is_none()
+            scope.parent_run_id.is_none()
+                && scope.agent_id.as_deref().is_none_or(|agent| agent == "root")
         }) {
             let executed = ev.tool_count.unwrap_or_else(|| {
                 ev.tool_outcomes.as_ref().map_or_else(
@@ -598,6 +599,13 @@ mod tests {
         let mut failed = turn_event("t1", 100, 10, "sonnet");
         failed.event_type = astra_services::session_journal::JournalEventType::TurnError;
         failed.tool_count = Some(4);
+        // Matches report_turn_failure's production identity.
+        failed.producer_scope = Some(astra_services::session_journal::JournalProducerScope {
+            run_id: "root".into(),
+            parent_run_id: None,
+            agent_id: Some("root".into()),
+            local_turn: Some(1),
+        });
         let mut child = failed.clone();
         child.producer_scope = Some(astra_services::session_journal::JournalProducerScope {
             run_id: "child".into(),
@@ -611,7 +619,7 @@ mod tests {
     }
 
     #[test]
-    fn tree_counts_only_executed_legacy_records_and_prefers_scalar() {
+    fn tree_counts_root_legacy_records_and_prefers_scalar() {
         let mut turn = turn_event("t1", 100, 10, "sonnet");
         turn.tool_calls = Some(serde_json::from_value(json!([
             {"name": "Read", "ok": true, "ms": 1},

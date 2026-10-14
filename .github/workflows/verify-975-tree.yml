@@ -34,7 +34,7 @@ jobs:
         run: |
           set -euo pipefail
           set +e
-          cargo test --locked -p astra-cli --lib tree_counts_ -- --nocapture 2>&1 | tee evidence/red.log
+          cargo test --locked -p astra-cli --lib tree_counts_root -- --nocapture 2>&1 | tee evidence/red.log
           result=${PIPESTATUS[0]}
           set -e
           test "$result" -ne 0
