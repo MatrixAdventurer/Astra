@@ -1,11 +1,11 @@
-name: Test Suite
+name: Verify 1007 Rust Test Suite
 
 permissions:
   contents: read
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, verify/1007-full-gates-20261015]
   pull_request:
     branches: [main, develop]
 
@@ -38,7 +38,7 @@ jobs:
           persist-credentials: false
       - name: Classify changed paths
         id: scope
-        run: python3 scripts/ci/ci_scope.py
+        run: python3 scripts/ci/ci_scope.py Cargo.lock
 
   # Package groups remain parallel. CLI builds and executes its full inventory
   # once; stable protected labels require that same completed test result.
