@@ -1,0 +1,42 @@
+name: Generate and verify rustls security update
+on:
+  push:
+    branches: [verify/1007-rustls-20261015]
+permissions:
+  contents: read
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: ./.github/actions/rust-setup
+        with:
+          shared-key: rustls-security
+          install-nextest: 'false'
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29
+        with:
+          tool: cargo-audit@0.22.1
+      - name: Generate narrow lockfile update
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/generation-head.txt
+          cargo update -p rustls@0.23.45 --precise 0.23.46
+          git diff -- Cargo.lock > evidence/candidate.patch
+          git diff --numstat -- Cargo.lock > evidence/numstat.txt
+          cp Cargo.lock evidence/Cargo.lock
+          git diff --check
+      - name: Verify fixed security gate
+        run: make audit
+      - name: Compile actual workspace consumers
+        run: cargo check --locked --workspace --all-targets
+      - name: Retain generated candidate and evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rustls-security-candidate
+          path: evidence
