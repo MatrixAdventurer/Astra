@@ -1,0 +1,61 @@
+name: Verify production journal error identity
+on:
+  push:
+    branches: [verify/974-identity-fix-20261014]
+permissions:
+  contents: read
+jobs:
+  identity-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: ./.github/actions/rust-setup
+        with:
+          shared-key: journal-identity
+          save-cache: 'true'
+      - name: Actual baseline failure then fixed regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p verification-evidence
+          evidence_tmp=$(mktemp -d)
+          source_path=crates/astra-cli/src/cli/journal_diff.rs
+          cp "$source_path" "$evidence_tmp/fixed.rs"
+          git show 8c96f9a910b81b599ae850ddef4539e84c5da314:"$source_path" > "$source_path"
+          set +e
+          cargo test --locked -p astra-cli --lib review_followup_production_error_without_run_id -- --nocapture > verification-evidence/baseline.log 2>&1
+          baseline_status=$?
+          set -e
+          cat verification-evidence/baseline.log
+          test "$baseline_status" -eq 101
+          grep -F 'review_followup_production_error_without_run_id_is_not_counted_twice ... FAILED' verification-evidence/baseline.log
+          grep -F 'test result: FAILED.' verification-evidence/baseline.log
+          cp "$evidence_tmp/fixed.rs" "$source_path"
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo test --locked -p astra-cli --lib journal_diff -- --nocapture
+      - name: Full CLI tests and lint
+        run: |
+          cargo build --locked -p astra-cli --bin mock_mcp_server
+          cargo nextest run --locked -p astra-cli --lib --bins --profile ci
+          cargo clippy --locked -p astra-cli --all-targets -- -D warnings
+      - name: Save source and reproducible evidence
+        if: always()
+        run: |
+          mkdir -p verification-evidence
+          cp crates/astra-cli/src/cli/journal_diff.rs verification-evidence/
+          git diff > verification-evidence/formatting.patch
+          git rev-parse HEAD > verification-evidence/commit.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: production-identity-evidence
+          path: verification-evidence

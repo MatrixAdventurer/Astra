@@ -264,7 +264,7 @@ impl<'a> TerminalIndex<'a> {
     /// only joins a terminal of its own run. Among candidates, an exact
     /// run-id match wins, then the first terminal after the round, then the
     /// nearest one before it.
-    fn owner(&self, events: &[JournalEvent], round_idx: usize) -> Option<usize> {
+    fn owner(&self, events: &[JournalEvent], round_idx: usize, inferred_scope: Option<(&str, bool)>) -> Option<usize> {
         let round = &events[round_idx];
         let turn = round.turn?;
         let nearest = |list: Option<&Vec<usize>>| {
@@ -274,8 +274,8 @@ impl<'a> TerminalIndex<'a> {
                 .or_else(|| after.checked_sub(1).and_then(|b| list.get(b)))
                 .copied()
         };
-        let child = is_child_round(round);
-        match run_id_of(round) {
+        let child = is_child_round(round) || inferred_scope.is_some_and(|(_, child)| child);
+        match run_id_of(round).or(inferred_scope.map(|(run, _)| run)) {
             Some(run) => nearest(self.by_run.get(&(turn, run))).or_else(|| {
                 (!child)
                     .then(|| nearest(self.anonymous.get(&turn)))
@@ -318,14 +318,44 @@ fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
     // Sequence chunks keyed by the journal position they are emitted at.
     let mut slots: BTreeMap<(usize, usize, usize), &ToolCallRecord> = BTreeMap::new();
     let mut orphan_ids = std::collections::HashSet::new();
+    // Production ToolCallError records lack a run ID. Resolve only an
+    // unambiguous (turn, call ID) witness; never merge different known runs.
+    let mut call_runs: HashMap<(Option<u32>, &str), Option<(&str, bool)>> = HashMap::new();
+    for e in events {
+        if let Some(run) = run_id_of(e) {
+            for call in e.tool_calls.iter().flatten() {
+                if let Some(id) = call.tool_call_id.as_deref() {
+                    call_runs.entry((e.turn, id))
+                        .and_modify(|known| {
+                            if let Some((known_run, child)) = known {
+                                if *known_run == run {
+                                    *child |= is_child_round(e);
+                                } else {
+                                    *known = None;
+                                }
+                            }
+                        })
+                        .or_insert(Some((run, is_child_round(e))));
+                }
+            }
+        }
+    }
     for (idx, e) in events.iter().enumerate() {
         if let Some(calls) = round_calls(e) {
-            match index.owner(events, idx) {
+            let witness = (e.event_type == JournalEventType::ToolCallError && calls.len() == 1 && run_id_of(e).is_none())
+                .then(|| calls[0].tool_call_id.as_deref()
+                    .and_then(|id| call_runs.get(&(e.turn, id)).copied()))
+                .flatten();
+            let ambiguous = witness == Some(None);
+            if ambiguous { out.complete = false; }
+            let inferred_scope = witness.flatten();
+            let owner = (!ambiguous).then(|| index.owner(events, idx, inferred_scope)).flatten();
+            match owner {
                 Some(t) => owned.entry(t).or_default().push(idx),
                 None => {
                     for (offset, call) in calls.iter().enumerate() {
                         if call.tool_call_id.as_deref().is_some_and(|id| {
-                            !orphan_ids.insert((e.turn, run_id_of(e), id))
+                            !orphan_ids.insert((e.turn, run_id_of(e).or(inferred_scope.map(|(run, _)| run)), id))
                         }) {
                             continue;
                         }
@@ -870,12 +900,43 @@ mod tests {
         assert!(super::run_id_of(&error).is_none());
         let round = evt(json!({"type":"llm_round","ts":"t","session_id":"a","turn":1,
             "producer_scope":{"run_id":"root"},"tool_calls":[record]}));
-        for events in [vec![error.clone(), round.clone()], vec![round, error]] {
+        let terminal = evt(json!({"type":"turn_error","ts":"t","session_id":"a","turn":1,
+            "producer_scope":{"run_id":"root"},"tool_count":1}));
+        for events in [vec![error.clone(), round.clone()], vec![round.clone(), error.clone()],
+            vec![error.clone(), round.clone(), terminal.clone()], vec![terminal, round.clone(), error]] {
             let diff = diff_events("a", "b", &events, &[]);
             assert_eq!(diff.a_tool_sequence, ["bash"]);
             assert_eq!(diff.a_tool_calls_executed, 1);
             assert!(diff.a_tool_sequence_complete);
         }
+        // A reused provider ID in a distinct known run is not a duplicate.
+        let mut other = round.clone();
+        other.producer_scope.as_mut().unwrap().run_id = "other".to_string();
+        let diff = diff_events("a", "b", &[round, other], &[]);
+        assert_eq!(diff.a_tool_sequence, ["bash", "bash"]);
+        assert_eq!(diff.a_tool_calls_executed, 2);
+    }
+
+    #[test]
+    fn review_followup_inferred_child_never_joins_anonymous_root() {
+        let record: super::ToolCallRecord = serde_json::from_value(json!({
+            "tool_call_id":"child-failure","name":"bash","ok":false,"ms":1
+        })).unwrap();
+        let error = JournalEvent::tool_call_error(Some("a"), 1, "bash", "failed", record.clone());
+        let child = evt(json!({"type":"llm_round","ts":"t","session_id":"a","turn":1,
+            "producer_scope":{"run_id":"child","parent_run_id":"root"},"tool_calls":[record]}));
+        let root = evt(json!({"type":"turn","ts":"t","session_id":"a","turn":1,"tool_count":0}));
+        for a in [vec![error.clone(),child.clone(),root.clone()], vec![root.clone(),child.clone(),error.clone()]] {
+            let d = diff_events("a", "b", &a, &[]);
+            assert_eq!(d.a_tool_sequence, ["bash"]);
+            assert_eq!(d.a_tool_calls_executed, 1);
+            assert!(d.a_tool_sequence_complete);
+        }
+        let mut other = child.clone();
+        other.producer_scope.as_mut().unwrap().run_id = "other".to_string();
+        let d = diff_events("a", "b", &[error,child,other,root], &[]);
+        assert_eq!(d.a_tool_calls_executed, 3);
+        assert!(!d.a_tool_sequence_complete, "conflicting identities cannot prove complete attribution");
     }
 
     #[test]
