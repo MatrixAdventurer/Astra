@@ -31,7 +31,9 @@ jobs:
           cp Cargo.lock evidence/Cargo.lock
           git diff --check
       - name: Verify fixed security gate
-        run: make audit
+        run: |
+          git clone --depth 1 https://github.com/RustSec/advisory-db "$HOME/.cargo/advisory-db"
+          make audit
       - name: Compile actual workspace consumers
         run: cargo check --locked --workspace --all-targets
       - name: Retain generated candidate and evidence
