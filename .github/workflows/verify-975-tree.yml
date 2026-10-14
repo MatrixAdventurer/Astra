@@ -1,7 +1,7 @@
 name: Verify journal tree root tool counts
 on:
   push:
-    branches: [verify/975-tree-tools-20261015]
+    branches: [verify/975-tree-baseline-export-20261015]
 permissions:
   contents: read
 jobs:
@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-          fetch-depth: 2
+          fetch-depth: 0
       - uses: ./.github/actions/rust-setup
         with:
           shared-key: cli
@@ -22,7 +22,8 @@ jobs:
           set -euo pipefail
           mkdir -p evidence
           cp crates/astra-cli/src/cli/journal_tree.rs evidence/candidate.rs
-          git show 89dcde88f25d9de9ac91752365ca814ddeff626e:crates/astra-cli/src/cli/journal_tree.rs > evidence/baseline.rs
+          test "$(git hash-object .github/verification/journal-tree-baseline.rs)" = 9fa13e7682e23c1f0ac1ee4121ed5b2bcf28cac2
+          cp .github/verification/journal-tree-baseline.rs evidence/baseline.rs
           python3 - <<'PY'
           from pathlib import Path
           candidate = Path("evidence/candidate.rs").read_text()
