@@ -1,4 +1,5 @@
 name: Verify 975 Personal Static Checks
+run-name: Verify 975 Personal static ${{ github.sha }}
 
 permissions:
   contents: read
