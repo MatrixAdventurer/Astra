@@ -1,4 +1,5 @@
 name: Verify 975 tree formatted Static Checks
+run-name: "Verify 975 formatted tree gates at ${{ github.sha }}"
 
 permissions:
   contents: read
