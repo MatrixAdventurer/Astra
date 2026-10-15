@@ -1,13 +1,14 @@
-name: Static Checks
+name: Verify 975 Personal Static Checks
+run-name: Verify 975 Personal static ${{ github.sha }}
 
 permissions:
   contents: read
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, verify/975-static-pr-20261015]
   pull_request:
-    branches: [main, develop]
+    branches: [main, develop, verify/975-static-base-20261015]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -37,7 +38,7 @@ jobs:
           persist-credentials: false
       - name: Classify changed paths
         id: scope
-        run: python3 scripts/ci/ci_scope.py
+        run: python3 scripts/ci/ci_scope.py crates/astra-cli/src/cli/journal_tree.rs
 
   docker-dependencies:
     name: Validate Docker dependency inputs

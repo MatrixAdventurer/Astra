@@ -32,7 +32,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use astra_services::session_journal::{self, JournalEvent, JournalEventType};
+use astra_services::session_journal::{self, JournalEvent, JournalEventType, ToolOutcomeSummary};
 
 use crate::cli::cli_config::cli_args;
 use crate::cli::journal_digest;
@@ -81,7 +81,7 @@ pub struct DelegationNode {
     /// Root's own completion tokens (Turn/LlmRound only, excludes children).
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub self_completion_tokens: u64,
-    /// Tool invocations on this sub-run.
+    /// Executed tool calls; the root includes its own terminal counts and children.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub tool_calls: u32,
     /// Nested sub-runs.
@@ -131,6 +131,31 @@ pub(crate) fn fold_events_into_tree(
     let mut by_run_id: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
     for ev in events {
+        // Root terminals own executed-call totals. Their LlmRound records are
+        // detail, not additional executions; child terminals roll up separately.
+        if matches!(
+            ev.event_type,
+            JournalEventType::Turn | JournalEventType::TurnError
+        ) && ev.producer_scope.as_ref().is_none_or(|scope| {
+            scope.parent_run_id.is_none()
+                && scope
+                    .agent_id
+                    .as_deref()
+                    .is_none_or(|agent| agent == "root")
+        }) {
+            let executed = ev.tool_count.unwrap_or_else(|| {
+                ev.tool_outcomes.as_ref().map_or_else(
+                    || {
+                        ToolOutcomeSummary::from_records(
+                            ev.tool_calls.as_deref().unwrap_or_default(),
+                        )
+                        .executed
+                    },
+                    |outcomes| outcomes.executed,
+                )
+            });
+            root.tool_calls = root.tool_calls.saturating_add(executed);
+        }
         match ev.event_type {
             JournalEventType::Turn | JournalEventType::LlmRound => {
                 // Root-level token accumulation. Use prompt_tokens +
@@ -549,5 +574,71 @@ mod tests {
             txt.contains("└── reviewer"),
             "last child should use corner connector: {txt}"
         );
+    }
+
+    #[test]
+    fn tree_counts_root_executions_once_and_rolls_up_children() {
+        let mut turn = turn_event("t3", 100, 10, "sonnet");
+        turn.tool_count = Some(3);
+        let mut round = turn.clone();
+        round.event_type = astra_services::session_journal::JournalEventType::LlmRound;
+        let events = vec![
+            round,
+            turn,
+            sub_started("t4", "child", "coder", "task"),
+            sub_completed("t5", "child", 50, 5, 2),
+        ];
+        let (root, _, skipped) = fold_events_into_tree("sess-1", &events);
+        assert_eq!(skipped, 0);
+        assert_eq!(root.tool_calls, 5);
+        assert!(render_text(&root).contains("tool_calls=5"));
+        let json = serde_json::to_value(&root).unwrap();
+        assert_eq!(json["tool_calls"], 5);
+        assert_eq!(json["children"][0]["tool_calls"], 2);
+    }
+
+    #[test]
+    fn tree_counts_root_failed_attempts_but_excludes_child_terminals() {
+        let mut failed = turn_event("t1", 100, 10, "sonnet");
+        failed.event_type = astra_services::session_journal::JournalEventType::TurnError;
+        failed.tool_count = Some(4);
+        // Matches report_turn_failure's production identity.
+        failed.producer_scope = Some(astra_services::session_journal::JournalProducerScope {
+            run_id: "root".into(),
+            parent_run_id: None,
+            agent_id: Some("root".into()),
+            local_turn: Some(1),
+        });
+        let mut child = failed.clone();
+        child.producer_scope = Some(astra_services::session_journal::JournalProducerScope {
+            run_id: "child".into(),
+            parent_run_id: Some("root".into()),
+            agent_id: Some("coder".into()),
+            local_turn: Some(1),
+        });
+        child.tool_count = Some(20);
+        let (root, _, _) = fold_events_into_tree("sess-1", &[failed, child]);
+        assert_eq!(root.tool_calls, 4);
+    }
+
+    #[test]
+    fn tree_counts_root_legacy_records_and_prefers_scalar() {
+        let mut turn = turn_event("t1", 100, 10, "sonnet");
+        turn.tool_calls = Some(
+            serde_json::from_value(json!([
+                {"name": "Read", "ok": true, "ms": 1},
+                {"name": "Bash", "ok": false, "ms": 1},
+                {"name": "Read", "ok": true, "ms": 0, "disposition": "reused"},
+                {"name": "Bash", "ok": false, "ms": 0, "disposition": "rejected"},
+                {"name": "Read", "ok": true, "ms": 0, "disposition": "suppressed"},
+                {"name": "Read", "ok": true, "ms": 0, "disposition": "deferred"}
+            ]))
+            .unwrap(),
+        );
+        let (root, _, _) = fold_events_into_tree("sess-1", &[turn.clone()]);
+        assert_eq!(root.tool_calls, 2);
+        turn.tool_count = Some(0);
+        let (root, _, _) = fold_events_into_tree("sess-1", &[turn]);
+        assert_eq!(root.tool_calls, 0);
     }
 }
