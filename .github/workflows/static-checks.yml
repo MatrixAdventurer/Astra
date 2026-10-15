@@ -6,9 +6,9 @@ permissions:
 
 on:
   push:
-    branches: [main, develop, verify/975-tree-personal-static-20261015]
+    branches: [main, develop, verify/975-static-pr-20261015]
   pull_request:
-    branches: [main, develop]
+    branches: [main, develop, verify/975-static-base-20261015]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
