@@ -5404,7 +5404,7 @@ fn test_spawn_run_config(allowed_tools: Vec<&str>, read_only: bool) -> SpawnRunC
     SpawnRunConfig {
         max_output_tokens: None,
         run_id: "child-run".to_string(),
-        cancellation_binding_id: "test-child-binding".to_string(),
+        cancellation_binding_id: Uuid::new_v4().to_string(),
         agent_id: "child@1234".to_string(),
         spawn_tool_call_id: None,
         recursion_depth: 1,
@@ -5632,11 +5632,22 @@ async fn server_prepare_mixed_native_and_model_children_uses_existing_policy_own
     let tool_name = "native_codex";
     let protocol = astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer;
     let native_id = NativeToolId::new(tool_name).unwrap();
-    let discovery = ProviderDiscoverySnapshot::new(
-        ProviderIdentity::new("selected-cli-native-provider").unwrap(),
-        ProviderBindingRef::new("selected-cli-native-binding").unwrap(),
-        ProviderProtocolId::new("native-agent-stage").unwrap(),
-        vec![ProviderToolDeclaration {
+    let model_catalog = astra_turn_types::ProviderModelCatalog::new(vec![
+        astra_turn_types::ProviderModelDescriptor {
+            selector: "native-model".into(),
+            display_name: "Native Model".into(),
+            aliases: vec!["native-alias".into()],
+            reasoning_efforts: vec![],
+            hidden: false,
+        },
+    ])
+    .unwrap();
+    let discovery =
+        ProviderDiscoverySnapshot::new(
+            ProviderIdentity::new("selected-cli-native-provider").unwrap(),
+            ProviderBindingRef::new("selected-cli-native-binding").unwrap(),
+            ProviderProtocolId::new("native-agent-stage").unwrap(),
+            vec![ProviderToolDeclaration {
             native_tool_id: native_id.clone(),
             native_tool_name: tool_name.into(),
             stable_tool_alias: None,
@@ -5647,6 +5658,7 @@ async fn server_prepare_mixed_native_and_model_children_uses_existing_policy_own
             claims: Default::default(),
             task_support: astra_turn_types::ProviderTaskSupport::Required,
             extension_fields: serde_json::Map::from_iter([
+                (astra_turn_types::PROVIDER_MODEL_CATALOG_KEY.into(), json!(model_catalog)),
                 (
                     astra_turn_types::PROVIDER_COLLABORATOR_STAGE_KEY.into(),
                     json!(true),
@@ -5658,12 +5670,12 @@ async fn server_prepare_mixed_native_and_model_children_uses_existing_policy_own
                 ),
             ]),
         }],
-    )
-    .unwrap();
+        )
+        .unwrap();
     let snapshot = resolve_provider_snapshot(
         &discovery,
         &Default::default(),
-        &BTreeMap::from([(native_id, PublicToolAlias::new(tool_name).unwrap())]),
+        &BTreeMap::from([(native_id.clone(), PublicToolAlias::new(tool_name).unwrap())]),
     )
     .unwrap();
     let descriptor = snapshot.descriptors[0].descriptor_ref();
@@ -5693,6 +5705,53 @@ async fn server_prepare_mixed_native_and_model_children_uses_existing_policy_own
             ..Default::default()
         },
     ];
+    for (catalog, model, accepted) in [
+        (Some(model_catalog.clone()), Some("native-model"), true),
+        (Some(model_catalog.clone()), Some("native-alias"), true),
+        (Some(model_catalog.clone()), Some("absent-model"), false),
+        (Some(model_catalog.clone()), Some("Native Model"), false),
+        (
+            Some(astra_turn_types::ProviderModelCatalog::unavailable()),
+            Some("native-model"),
+            false,
+        ),
+        (None, Some("native-model"), false),
+        (None, None, true),
+    ] {
+        let mut candidate = discovery.clone();
+        let fields = &mut candidate.tool_declarations[0].extension_fields;
+        fields.remove(astra_turn_types::PROVIDER_MODEL_CATALOG_KEY);
+        if let Some(catalog) = catalog {
+            fields.insert(
+                astra_turn_types::PROVIDER_MODEL_CATALOG_KEY.into(),
+                json!(catalog),
+            );
+        }
+        let snapshot = resolve_provider_snapshot(
+            &candidate,
+            &Default::default(),
+            &BTreeMap::from([(native_id.clone(), PublicToolAlias::new(tool_name).unwrap())]),
+        )
+        .unwrap();
+        tool_executor.set_provider_policy_index(
+            ResolvedProviderPolicyIndex::from_snapshots(&[snapshot]).unwrap(),
+        );
+        let mut batch = inputs.clone();
+        batch[0].execution.as_mut().unwrap().model = model.map(str::to_owned);
+        let result = executor.clone().prepare_batch(&batch, &context, None).await;
+        assert_eq!(result.is_ok(), accepted, "model={model:?}");
+        if let Err(error) = result {
+            assert_eq!(
+                error.error_kind(),
+                Some(astra_core::ErrorKind::InvalidRequest)
+            );
+        }
+        assert!(
+            edge_rx.try_recv().is_err(),
+            "preparation must not dispatch any child"
+        );
+    }
+    tool_executor.set_provider_policy_index(index.clone());
     let mut prepared = Arc::clone(&executor)
         .prepare_batch(&inputs, &context, None)
         .await
@@ -18237,6 +18296,26 @@ fn request_execution_bindings_keep_edge_workspace_without_server_reroute() {
     assert_eq!(executor.status, ExecutorStatus::Online);
 }
 
+fn native_edge_execution_request(executor_id: &str, root: &str) -> ChatRequestData {
+    let mut request = test_request("continue");
+    request.edge_executor_id = Some(executor_id.into());
+    request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+        kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
+        display_name: Some("Owner workspace".into()),
+        root: Some(root.into()),
+        source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath { path: root.into() }),
+        authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+    });
+    request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
+        kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
+        executor_id: Some(executor_id.into()),
+        display_name: Some("Owner edge".into()),
+        transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger),
+        status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+    });
+    request
+}
+
 #[tokio::test]
 async fn native_edge_execution_requires_owned_connection_and_exact_workspace() {
     let edge_pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
@@ -18278,24 +18357,7 @@ async fn native_edge_execution_requires_owned_connection_and_exact_workspace() {
         sender,
     );
     let service = test_service().with_edge_connection_pool(edge_pool);
-    let mut request = test_request("continue");
-    request.edge_executor_id = Some("edge-owner-1".to_string());
-    request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-        kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
-        display_name: Some("Owner workspace".to_string()),
-        root: Some("/workspace/owner".to_string()),
-        source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
-            path: "/workspace/owner".to_string(),
-        }),
-        authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-    });
-    request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
-        kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
-        executor_id: Some("edge-owner-1".to_string()),
-        display_name: Some("Owner edge".to_string()),
-        transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger),
-        status: Some(astra_services::runs::ExecutorStatusRequest::Online),
-    });
+    let mut request = native_edge_execution_request("edge-owner-1", "/workspace/owner");
     let mut discovered = Vec::new();
     let physical_id = service
         .authorize_native_edge_execution("owner-1", &request, &mut discovered)
@@ -18332,6 +18394,162 @@ async fn native_edge_execution_requires_owned_connection_and_exact_workspace() {
         .await
         .expect_err("a different workspace path must not authorize the Edge");
     assert_eq!(denied.0, StatusCode::PRECONDITION_REQUIRED);
+}
+
+#[tokio::test]
+async fn native_edge_execution_waits_for_pool_publication_and_cancels_queued_admission() {
+    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let service = test_service().with_edge_connection_pool(pool.clone());
+    let request = native_edge_execution_request("edge-publication", "/workspace/publication");
+    let publication = pool.registration_lock("owner", "edge-publication");
+    let publishing = publication.lock().await;
+    let reconnect = pool.begin_reconnect("owner", "edge-publication");
+    {
+        let mut discovery = Vec::new();
+        let mut cancelled =
+            Box::pin(service.authorize_native_edge_execution("owner", &request, &mut discovery));
+        // Without the admission barrier the real method immediately returns
+        // 428 against the not-yet-published pool. No task timing is involved.
+        assert!(futures_util::poll!(&mut cancelled).is_pending());
+        drop(cancelled);
+    }
+    let mut discovery = Vec::new();
+    let mut admission =
+        Box::pin(service.authorize_native_edge_execution("owner", &request, &mut discovery));
+    assert!(futures_util::poll!(&mut admission).is_pending());
+    let other_request = native_edge_execution_request("other-edge", "/workspace/publication");
+    for (user, request) in [("other-owner", &request), ("owner", &other_request)] {
+        let mut other_discovery = Vec::new();
+        let mut independent =
+            Box::pin(service.authorize_native_edge_execution(user, request, &mut other_discovery));
+        let std::task::Poll::Ready(denied) = futures_util::poll!(&mut independent) else {
+            panic!("another owner/executor key must not wait for this publication");
+        };
+        assert_eq!(denied.unwrap_err().0, StatusCode::PRECONDITION_REQUIRED);
+    }
+    let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+    pool.commit_reconnect_with_registry_and_materialization_id(
+        reconnect,
+        "owner",
+        "edge-publication",
+        None,
+        Some("/workspace/publication".into()),
+        None,
+        None,
+        Some("registry-publication".into()),
+        Some("materialization-publication".into()),
+        Some("ws-publication".into()),
+        sender,
+    );
+    drop(publishing);
+    let physical = admission
+        .await
+        .expect("published materialization must authorize");
+    assert_eq!(
+        physical,
+        Some(
+            astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+                "materialization-publication",
+                "/workspace/publication",
+            ),
+        )
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn native_edge_execution_waits_for_aborted_registration_rollback_on_matrixone() {
+    use astra_services::multi_agent::EdgeRegistryService;
+    let db = setup_lifecycle_run_db_it().await;
+    let registry = Arc::new(astra_services::DatabaseEdgeRegistryService::from_shared(
+        &db,
+    ));
+    let user = Uuid::new_v4().to_string();
+    let edge = "edge-rollback";
+    let root = "/workspace/rollback";
+    let initial = registry
+        .register_or_update_with_lease_and_materialization(
+            &user,
+            edge,
+            "rest-predecessor",
+            None,
+            Some(root),
+            None,
+            None,
+            Some("materialization-rollback"),
+        )
+        .await
+        .unwrap();
+    assert!(registry.finalize_registration(&initial).await.unwrap());
+    assert!(registry.release_registration(&initial).await.unwrap());
+
+    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let service = test_service()
+        .with_edge_connection_pool(pool.clone())
+        .with_edge_registry_service(registry.clone());
+    let request = native_edge_execution_request(edge, root);
+    let publication = pool.registration_lock(&user, edge);
+    let publishing = publication.lock().await;
+    let reconnect = pool.begin_reconnect(&user, edge);
+    let successor = registry
+        .register_or_update_with_lease_and_materialization(
+            &user,
+            edge,
+            "ws-aborted",
+            None,
+            Some(root),
+            None,
+            None,
+            Some("materialization-rollback"),
+        )
+        .await
+        .unwrap();
+    assert!(registry.finalize_registration(&successor).await.unwrap());
+    assert!(
+        registry
+            .find_by_user_agent_and_workspace(&user, edge, None)
+            .await
+            .unwrap()
+            .is_none(),
+        "finalized state 2 must remain hidden"
+    );
+
+    let mut discovery = Vec::new();
+    let mut admission =
+        Box::pin(service.authorize_native_edge_execution(&user, &request, &mut discovery));
+    assert!(futures_util::poll!(&mut admission).is_pending());
+    pool.abort_reconnect(reconnect, &user, edge);
+    assert!(registry.rollback_registration(&successor).await.unwrap());
+    let restored = registry
+        .find_by_user_agent_and_workspace(&user, edge, None)
+        .await
+        .unwrap()
+        .expect("published predecessor must be restored");
+    assert_eq!(restored.registry_id, initial.current.registry_id);
+    assert_eq!(restored.edge_id, "rest-predecessor");
+    assert_eq!(restored.worktree_path.as_deref(), Some(root));
+    assert_eq!(
+        restored.materialization_id.as_deref(),
+        Some("materialization-rollback")
+    );
+    drop(publishing);
+    assert_eq!(
+        admission.await.unwrap(),
+        Some(
+            astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+                "materialization-rollback",
+                root,
+            ),
+        )
+    );
+
+    sqlx::query("DELETE FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?")
+        .bind(&user)
+        .bind(edge)
+        .execute(db.get())
+        .await
+        .unwrap();
+    db.close().await;
 }
 
 #[tokio::test]
@@ -27907,6 +28125,160 @@ async fn active_run_control_watcher_cancels_token_after_slow_durable_poll() {
     assert!(cancel_token.is_cancelled());
     assert!(!pause_flag.load(Ordering::Acquire));
     assert_eq!(provider.calls(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires MatrixOne DB: 1000 real control watchers, not 1000 LLM loops"]
+async fn thousand_control_watchers_batch_across_owners_and_observe_remote_changes() {
+    let pool = setup_lifecycle_run_db_it().await;
+    let prefix = format!("cw-{}", Uuid::new_v4());
+    let ids = (0..1000)
+        .map(|i| format!("{prefix}-{i}"))
+        .collect::<Vec<_>>();
+    let mut sessions = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "INSERT INTO agent_sessions (user_id,session_id,status) ",
+    );
+    sessions.push_values(&ids, |mut row, id| {
+        row.push_bind(id).push_bind(id).push_bind("active");
+    });
+    sessions.build().execute(pool.get()).await.unwrap();
+    let mut runs = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,ancestor_path,status,run_generation,last_event_idx) ",
+    );
+    runs.push_values(&ids, |mut row, id| {
+        row.push_bind(id)
+            .push_bind(id)
+            .push_bind(id)
+            .push_bind(id)
+            .push_bind(format!("/{id}"))
+            .push_bind("running")
+            .push_bind(1)
+            .push_bind(7);
+    });
+    runs.build().execute(pool.get()).await.unwrap();
+    let engine = RunEngine::new(Arc::new(DatabaseRunStateStore::new(pool.clone())));
+    let control: Arc<dyn RunControlProvider> = Arc::new(engine);
+    // Hot-checkout telemetry excludes newly established physical connections.
+    // Preopen the whole bounded pool before counting the observer's reads.
+    let mut warmed = Vec::new();
+    for _ in 0..pool.settings().db_pool_max_connections {
+        warmed.push(pool.get().acquire().await.unwrap());
+    }
+    drop(warmed);
+    let before = astra_core::matrixone_pool_telemetry_snapshot();
+    let started = Instant::now();
+    let mut watchers = Vec::new();
+    for id in &ids {
+        let cancel = Arc::new(CancellationToken::new());
+        let pause = Arc::new(AtomicBool::new(false));
+        let lost = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = tokio::sync::watch::channel(-1);
+        let guard = start_active_run_control_watcher(
+            Some(control.clone()),
+            id.clone(),
+            id.clone(),
+            id.clone(),
+            Some(1),
+            Arc::new(AtomicBool::new(false)),
+            pause.clone(),
+            cancel.clone(),
+            lost.clone(),
+            sender,
+        )
+        .unwrap();
+        watchers.push((guard, cancel, pause, lost, receiver));
+    }
+    tokio::time::timeout(
+        Duration::from_secs(7),
+        futures_util::future::join_all(watchers.iter_mut().map(
+            |(_, _, _, _, receiver)| async move {
+                while *receiver.borrow_and_update() < 7 {
+                    receiver.changed().await.unwrap();
+                }
+            },
+        )),
+    )
+    .await
+    .expect("first shared control sweep");
+    let first_reads =
+        astra_core::matrixone_pool_telemetry_snapshot().hot_checkouts - before.hot_checkouts;
+    assert!(
+        (8..=12).contains(&first_reads),
+        "1000 roots must batch, got {first_reads} checkouts"
+    );
+    let initial_ms = started.elapsed().as_millis();
+
+    // A separate pool represents a different control-plane process. The live
+    // observers receive no local notification of these durable changes.
+    let independent = SharedPool::new(pool.settings()).await.unwrap();
+    for group in 0..4 {
+        let update = match group {
+            0 => "cancellation_requested_at=NOW(6)",
+            1 => "run_generation=2",
+            2 => "status='paused',waiting_for='user_pause'",
+            _ => "status='running'",
+        };
+        let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
+            "UPDATE agent_runs SET {update},last_event_idx=9 WHERE run_id IN ("
+        ));
+        {
+            let mut selected = query.separated(",");
+            for (index, id) in ids.iter().enumerate() {
+                if index % 4 == group {
+                    selected.push_bind(id);
+                }
+            }
+        }
+        query
+            .push(")")
+            .build()
+            .execute(independent.get())
+            .await
+            .unwrap();
+    }
+    let before = astra_core::matrixone_pool_telemetry_snapshot();
+    let changed = Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(7),
+        futures_util::future::join_all(watchers.iter_mut().enumerate().map(
+            |(index, (_, cancel, pause, lost, receiver))| async move {
+                if index % 4 < 2 {
+                    cancel.cancelled().await;
+                    assert_eq!(lost.load(Ordering::Acquire), index % 4 == 1);
+                } else {
+                    while *receiver.borrow_and_update() < 9 {
+                        receiver.changed().await.unwrap();
+                    }
+                    assert_eq!(pause.load(Ordering::Acquire), index % 4 == 2);
+                    assert!(!cancel.is_cancelled());
+                }
+            },
+        )),
+    )
+    .await
+    .expect("cross-pool cancellation, ownership fence, pause and input watermark");
+    let next_reads =
+        astra_core::matrixone_pool_telemetry_snapshot().hot_checkouts - before.hot_checkouts;
+    assert!(
+        (8..=12).contains(&next_reads),
+        "changed sweep must also batch: {next_reads}"
+    );
+    println!(
+        "control_watchers owners=1000 sessions=1000 initial_reads={first_reads} changed_reads={next_reads} initial_ms={initial_ms} change_ms={}",
+        changed.elapsed().as_millis()
+    );
+    drop(watchers);
+    drop(control);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    for table in ["agent_runs", "agent_sessions"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE user_id LIKE ?"))
+            .bind(format!("{prefix}-%"))
+            .execute(independent.get())
+            .await
+            .unwrap();
+    }
+    independent.close().await;
+    pool.close().await;
 }
 
 #[tokio::test(start_paused = true)]
