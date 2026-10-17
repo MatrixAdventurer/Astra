@@ -1,0 +1,29 @@
+name: Verify SDK WebSocket connection fix
+on:
+  push:
+    branches: [verify/1029-sdk-websocket]
+permissions:
+  contents: read
+jobs:
+  sdk-web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: .nvmrc
+      - name: SDK gates
+        working-directory: packages/sdk
+        env:
+          ASTRA_SDK_E2E: '1'
+        run: |
+          npm ci
+          npm run ci
+      - name: Web consumer gates
+        working-directory: web
+        run: |
+          npm ci
+          npm run ci
