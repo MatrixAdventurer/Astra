@@ -727,11 +727,53 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
+#[cfg(target_os = "linux")]
+fn is_wsl_kernel_release(release: &str) -> bool {
+    release.to_ascii_lowercase().contains("microsoft")
+}
+
+#[cfg(target_os = "linux")]
+fn running_in_wsl() -> bool {
+    std::env::var_os("WSL_DISTRO_NAME").is_some()
+        || std::env::var_os("WSL_INTEROP").is_some()
+        || std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .is_ok_and(|release| is_wsl_kernel_release(&release))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_login_browser_command(url: &str, wsl: bool) -> std::process::Command {
+    if wsl {
+        // Reuse the safe Windows launcher: the OAuth URL is passed as data via
+        // ASTRA_LOGIN_URL rather than interpolated into a shell command.
+        windows_browser_command(url)
+    } else {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(url);
+        command
+    }
+}
+
 pub(crate) fn open_login_url(url: &str) {
     #[cfg(target_os = "macos")]
     let result = std::process::Command::new("open").arg(url).spawn();
     #[cfg(target_os = "linux")]
-    let result = std::process::Command::new("xdg-open").arg(url).spawn();
+    let result = {
+        let wsl = running_in_wsl();
+        let mut command = linux_login_browser_command(url, wsl);
+        if wsl {
+            // Avoid leaking the launcher's diagnostics into the interactive TUI.
+            command.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            command.spawn().or_else(|_| {
+                std::process::Command::new("wslview")
+                    .arg(url)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+            })
+        } else {
+            command.spawn()
+        }
+    };
     #[cfg(target_os = "windows")]
     let result = windows_browser_command(url).spawn();
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -795,7 +837,7 @@ fn validate_login_website(value: &str) -> Result<url::Url, String> {
     Ok(url)
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 fn windows_browser_command(url: &str) -> std::process::Command {
     let mut command = std::process::Command::new("powershell.exe");
     // The URL is data in the child environment, never shell source. In
@@ -1630,6 +1672,22 @@ mod tests {
         ] {
             assert!(super::validate_login_website(bad).is_err(), "{bad}");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wsl_login_uses_windows_browser_without_interpreting_callback_url() {
+        assert!(super::is_wsl_kernel_release("5.15.167.4-microsoft-standard-WSL2"));
+        assert!(super::is_wsl_kernel_release("4.4.0-Microsoft"));
+        assert!(!super::is_wsl_kernel_release("6.8.0-generic"));
+        let url = "https://uc.example.com/authorize?client_id=astra-cli&response_type=code&state=abc";
+        let linux = super::linux_login_browser_command(url, false);
+        assert_eq!(linux.get_program(), std::ffi::OsStr::new("xdg-open"));
+        let wsl = super::linux_login_browser_command(url, true);
+        assert_eq!(wsl.get_program(), std::ffi::OsStr::new("powershell.exe"));
+        assert!(wsl.get_envs().any(|(key, value)| key == "ASTRA_LOGIN_URL"
+            && value == Some(std::ffi::OsStr::new(url))));
+        assert!(wsl.get_args().all(|arg| !arg.to_string_lossy().contains(url)));
     }
 
     #[test]
