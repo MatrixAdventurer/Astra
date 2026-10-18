@@ -120,3 +120,49 @@ test('a constructor failure clears the pending attempt so a later connect can su
   await next;
   ws.close();
 });
+
+test('an error listener can synchronously start a fresh connection', async () => {
+  const ws = client();
+  let recovery: Promise<void> | undefined;
+  ws.on('stateChange', (state) => {
+    if (state === 'error') recovery = ws.connect();
+  });
+  try {
+    const first = ws.connect();
+    const failed = expect(first).rejects.toThrow('WebSocket connection failed');
+    ControlledSocket.instances[0].onerror?.();
+    recovery?.catch(() => {});
+    await failed;
+    expect(ControlledSocket.instances).toHaveLength(2);
+    ControlledSocket.instances[1].authenticate();
+    await recovery;
+    expect(ws.isConnected).toBe(true);
+  } finally {
+    ws.close();
+  }
+});
+
+test('connect from the connected notification succeeds after permanent reattach denial', async () => {
+  const ws = client();
+  let ready: Promise<void> | undefined;
+  ws.runId = 'missing-run';
+  ws.on('stateChange', (state) => {
+    if (state === 'connected') ready = ws.connect();
+  });
+  try {
+    const attaching = ws.connect();
+    const failed = expect(attaching).rejects.toThrow('Run not found');
+    ControlledSocket.instances[0].authenticate();
+    ControlledSocket.instances[0].onmessage?.({ data: JSON.stringify({
+      type: 'error', code: 'NOT_FOUND', retryable: false, message: 'Run not found',
+    }) });
+    ready?.catch(() => {});
+    await failed;
+    await expect(ready).resolves.toBeUndefined();
+    expect(ws.runId).toBeNull();
+    expect(ws.isConnected).toBe(true);
+    expect(ControlledSocket.instances).toHaveLength(1);
+  } finally {
+    ws.close();
+  }
+});

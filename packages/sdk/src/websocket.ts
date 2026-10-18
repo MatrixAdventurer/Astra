@@ -284,12 +284,12 @@ export class AstraWebSocket {
             this.deferredTerminalReplayIndex = null;
             this.seenDeferredFrames.clear();
           }
+          pending.reject(new Error(data.message ?? "Run attachment failed"));
           if (!retryable && pending.fromReconnect) {
             this.reconnectAttempts = 0;
             this.setConnectionState("connected");
           }
           this.processEvent(data as StreamEvent);
-          pending.reject(new Error(data.message ?? "Run attachment failed"));
           if (retryable) {
             socket.close();
           }
@@ -321,10 +321,10 @@ export class AstraWebSocket {
 
     socket.onerror = () => {
       if (this.ws !== socket) return;
-      this.setConnectionState("error");
       if (!authenticated) {
         reject(new Error("WebSocket connection failed"));
       }
+      this.setConnectionState("error");
     };
   }
 
