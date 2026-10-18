@@ -1235,7 +1235,7 @@ impl ControlledProviderAttemptObserver<'_> {
             "terminalization" => "provider_attempt_terminalization",
             _ => "provider_attempt_persistence",
         };
-        let mut details = json!({
+        let details = json!({
             "source": crate::turn::llm::durable::INFERENCE_LEDGER_ERROR_SOURCE,
             "deadline": {
                 "scope": "inference_ledger",
@@ -1244,18 +1244,15 @@ impl ControlledProviderAttemptObserver<'_> {
                 "retry_safety": "none"
             }
         });
-        if let Some(terminal) = terminal {
-            details["provider_terminal"] = json!({
-                "status": terminal.status.as_str(),
-                "usage_status": terminal.usage_status.as_str(),
-                "error_kind": terminal.error_kind,
-            });
-        }
-        astra_core::ClassifiedError::new(
+        let error = astra_core::ClassifiedError::new(
             astra_core::ErrorKind::DatabaseError,
             format!("durable inference ledger timed out during provider attempt {stage}"),
         )
-        .with_details_json(details.to_string())
+        .with_details_json(details.to_string());
+        match terminal {
+            Some(terminal) => attach_provider_terminal_evidence(error, terminal),
+            None => error,
+        }
     }
 }
 
@@ -1449,6 +1446,26 @@ pub(crate) fn classify_provider_send_error(
     )
 }
 
+/// A settlement error cannot erase the physical terminal already supplied by
+/// the adapter. Preserve only typed terminal facts, never provider error prose.
+fn attach_provider_terminal_evidence(
+    error: astra_core::ClassifiedError,
+    terminal: &astra_services::InferenceInvocationTerminal,
+) -> astra_core::ClassifiedError {
+    let mut details = error
+        .details_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    details["provider_terminal"] = json!({
+        "status": terminal.status.as_str(),
+        "usage_status": terminal.usage_status.as_str(),
+        "error_kind": terminal.error_kind,
+    });
+    error.with_details_json(details.to_string())
+}
+
 pub(crate) async fn finish_observed_provider_attempt(
     observer: Option<&dyn ProviderAttemptObserver>,
     attempt_index: Option<u32>,
@@ -1457,7 +1474,10 @@ pub(crate) async fn finish_observed_provider_attempt(
     let (Some(observer), Some(attempt_index)) = (observer, attempt_index) else {
         return Ok(());
     };
-    observer.finish_attempt(attempt_index, terminal).await
+    observer
+        .finish_attempt(attempt_index, terminal)
+        .await
+        .map_err(|error| attach_provider_terminal_evidence(error, terminal))
 }
 
 fn note_observed_provider_usage_presence(
@@ -3898,6 +3918,7 @@ fn strip_internal_runtime_markers(messages: &mut [Value]) {
             object.remove(astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD);
             object.remove(astra_turn_types::MODEL_ITEM_ID_FIELD);
             object.remove("_compact_boundary");
+            object.remove(astra_turn_core::cloud::history_summary::HISTORY_SUMMARY_FIELD);
             // These fields are compaction/checkpoint bookkeeping. They are
             // useful in runtime history, but are not part of the provider
             // message contract and only add round-specific bytes to the
@@ -12144,6 +12165,62 @@ mod tests {
         }
     }
 
+    struct FailingFinishAttemptObserver(astra_core::ErrorKind);
+
+    #[async_trait]
+    impl ProviderAttemptObserver for FailingFinishAttemptObserver {
+        async fn begin_attempt(
+            &self,
+            _: &ProviderWireRequestIdentity,
+            _: Option<u32>,
+        ) -> Result<ProviderAttemptAdmission, astra_core::ClassifiedError> {
+            Ok(ProviderAttemptAdmission::Admitted(0))
+        }
+        async fn finish_attempt(
+            &self,
+            _: u32,
+            _: &astra_services::InferenceInvocationTerminal,
+        ) -> Result<(), astra_core::ClassifiedError> {
+            Err(
+                astra_core::ClassifiedError::new(self.0, "fixture settlement failure")
+                    .with_details_json(
+                        json!({"source":"inference_execution_ledger", "existing":"retained"})
+                            .to_string(),
+                    ),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn settlement_error_retains_actual_provider_terminal_for_all_error_shapes() {
+        for kind in [
+            astra_core::ErrorKind::DatabaseError,
+            astra_core::ErrorKind::Cancelled,
+        ] {
+            let terminal = astra_services::InferenceInvocationTerminal::succeeded(
+                astra_services::InferenceUsage::default(),
+                Some("provider-response".into()),
+            );
+            let error = finish_observed_provider_attempt(
+                Some(&FailingFinishAttemptObserver(kind)),
+                Some(0),
+                &terminal,
+            )
+            .await
+            .expect_err("runtime must still reject unsettled delivery");
+            assert_eq!(error.kind, kind);
+            let details: Value =
+                serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
+            assert_eq!(details["existing"], "retained");
+            assert_eq!(details["provider_terminal"]["status"], "succeeded");
+            assert_eq!(
+                details["provider_terminal"]["usage_status"],
+                "provider_exact"
+            );
+            assert!(details["provider_terminal"].get("error_message").is_none());
+        }
+    }
+
     #[async_trait]
     impl ProviderAttemptObserver for PendingFinishAttemptObserver {
         async fn begin_attempt(
@@ -15801,6 +15878,7 @@ mod tests {
             astra_turn_types::RuntimeMessageDelivery::RequiredContext,
         );
         runtime["_compact_boundary"] = Value::Bool(true);
+        runtime[astra_turn_core::cloud::history_summary::HISTORY_SUMMARY_FIELD] = json!(1);
         runtime[astra_turn_types::USER_TURN_SEMANTICS_FIELD] = json!({
             "schema_version": 1,
             "objective_relation": "continue"
@@ -15846,6 +15924,11 @@ mod tests {
                 .is_none()
         );
         assert!(out[0].get("_compact_boundary").is_none());
+        assert!(
+            out[0]
+                .get(astra_turn_core::cloud::history_summary::HISTORY_SUMMARY_FIELD)
+                .is_none()
+        );
         for key in [
             "_round_index",
             "_tool_name",
@@ -16474,6 +16557,203 @@ mod tests {
         );
         assert_eq!(body["toolConfig"]["tools"][0]["toolSpec"]["name"], "bash");
         assert_eq!(body["inferenceConfig"]["maxTokens"], 128);
+    }
+
+    #[tokio::test]
+    async fn inline_summary_bedrock_wire_survives_three_generations_and_legacy_resume() {
+        use astra_turn_core::cloud::{
+            history_summary::{
+                HISTORY_SUMMARY_FIELD, history_summary_message, history_summary_text,
+            },
+            summary::{
+                InlineSummaryHistoryProjection, generate_inline_summary,
+                test_support::MockSummaryClient,
+            },
+        };
+
+        const SUMMARY: &str = "### Primary Request\nPRIOR_FACT\n### Pending Tasks\nFinish\n### Current Work\nImplement\n### Current State\nVerified";
+        let seeds = [
+            None,
+            Some(history_summary_message(SUMMARY.into())),
+            Some(
+                json!({"role":"system", "content":format!("[Conversation compacted — 20 messages summarized]\n\n{SUMMARY}")}),
+            ),
+            Some(
+                json!({"role":"system", "content":format!("[Context compressed — 20 earlier messages]\n\n{SUMMARY}")}),
+            ),
+        ];
+        for append_only in [false, true] {
+            let mut stable = json!({
+                "role":"system",
+                "content":format!("STABLE_POLICY\n{}", astra_turn_types::APPEND_ONLY_RUNTIME_AUTHORITY_POLICY),
+            });
+            astra_turn_types::mark_append_only_runtime_authority_policy(&mut stable);
+            for seed in &seeds {
+                let mut previous = seed.clone();
+                for generation in 1..=3 {
+                    let mut history: Vec<Value> = previous.iter().cloned().collect();
+                    history.push(json!({"role":"system", "content":"HISTORY_SIDE_POLICY"}));
+                    for round in 0..3 {
+                        let id = format!("call_{generation}_{round}");
+                        history.extend([
+                            json!({"role":"user", "content":format!("Continue {round}")}),
+                            json!({"role":"assistant", "content":null, "tool_calls":[{"id":id, "type":"function", "function":{"name":"read", "arguments":"{}"}}]}),
+                            json!({"role":"tool", "tool_call_id":id, "name":"read", "content":"observed fact"}),
+                            json!({"role":"assistant", "content":"observed"}),
+                        ]);
+                    }
+                    let mut authority = json!({"role":"user", "content":"RUNTIME_CONTROL"});
+                    astra_turn_types::mark_append_only_required_context(
+                        &mut authority,
+                        "final_answer_settlement",
+                        astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+                    );
+                    history.push(authority.clone());
+                    let response = format!("{SUMMARY}\nGENERATION_{generation}");
+                    let client = MockSummaryClient::ptl_then_success(&response);
+                    let accepted = generate_inline_summary(
+                        std::slice::from_ref(&stable),
+                        &history,
+                        if append_only {
+                            InlineSummaryHistoryProjection::AppendOnlyRuntimeAuthorityPrefix
+                        } else {
+                            InlineSummaryHistoryProjection::Semantic
+                        },
+                        &client,
+                    )
+                    .await
+                    .expect("valid summary after retry");
+                    let requests = client.recorded_requests();
+                    assert_eq!(requests.len(), 2);
+                    for (attempt, request) in requests.iter().enumerate() {
+                        assert_eq!(request.first(), Some(&stable));
+                        assert_eq!(request.contains(&authority), append_only);
+                        if let Some(previous) = &previous {
+                            let evidence = history_summary_text(previous).unwrap();
+                            assert!(request.iter().any(|message| {
+                                message["role"] == "assistant"
+                                    && message["content"]
+                                        .as_str()
+                                        .is_some_and(|text| text.contains(evidence))
+                            }));
+                        }
+                        // Exercise the canonical production provider builder,
+                        // not a copied projection or the recording client alone.
+                        let body = build_provider_request_body(
+                            request,
+                            &[],
+                            "amazon.nova-pro-v1:0",
+                            "bedrock",
+                            Some(1024),
+                            None,
+                            false,
+                            &ThinkingConfig::Off,
+                        );
+                        assert_eq!(body["system"], json!([{"text":stable["content"]}]));
+                        let wire = body["messages"].as_array().unwrap();
+                        assert_eq!(wire.first().unwrap()["role"], "user");
+                        assert_eq!(wire.last().unwrap()["role"], "user");
+                        assert!(
+                            wire.windows(2)
+                                .all(|pair| pair[0]["role"] != pair[1]["role"])
+                        );
+                        let serialized = serde_json::to_string(&body).unwrap();
+                        assert!(!serialized.contains("HISTORY_SIDE_POLICY"));
+                        assert!(!serialized.contains(HISTORY_SUMMARY_FIELD));
+                        assert_eq!(serialized.contains("RUNTIME_CONTROL"), append_only);
+                        if previous.is_some() {
+                            assert_eq!(wire[1]["role"], "assistant");
+                            assert!(
+                                wire[1]["content"][0]["text"]
+                                    .as_str()
+                                    .unwrap()
+                                    .contains("PRIOR_FACT")
+                            );
+                            assert!(
+                                !serde_json::to_string(&wire[0])
+                                    .unwrap()
+                                    .contains("PRIOR_FACT")
+                            );
+                        }
+                        let mut pending_tools = Vec::new();
+                        let mut paired = 0;
+                        for message in wire {
+                            for block in message["content"].as_array().unwrap() {
+                                if let Some(call) = block.get("toolUse") {
+                                    assert_eq!(message["role"], "assistant");
+                                    pending_tools.push(call["toolUseId"].clone());
+                                }
+                                if let Some(result) = block.get("toolResult") {
+                                    assert_eq!(message["role"], "user");
+                                    assert_eq!(pending_tools.remove(0), result["toolUseId"]);
+                                    paired += 1;
+                                }
+                            }
+                        }
+                        assert!(pending_tools.is_empty());
+                        assert_eq!(paired, 3 - attempt);
+                    }
+                    // Model the accepted storage envelope, then restore from
+                    // serialized history before the next generation.
+                    previous = Some(
+                        serde_json::from_str(
+                            &serde_json::to_string(&history_summary_message(accepted)).unwrap(),
+                        )
+                        .unwrap(),
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn inline_summary_bedrock_wire_accepts_summary_without_user_rounds() {
+        use astra_turn_core::cloud::{
+            history_summary::history_summary_message,
+            summary::{
+                InlineSummaryHistoryProjection, generate_inline_summary,
+                test_support::MockSummaryClient,
+            },
+        };
+        let summary = "### Primary Request\nPRIOR_FACT\n### Pending Tasks\nFinish\n### Current Work\nImplement\n### Current State\nVerified";
+        for trailing in [
+            None,
+            Some(json!({"role":"assistant", "content":"orphaned continuation"})),
+        ] {
+            let mut history = vec![history_summary_message(summary.into())];
+            history.extend(trailing);
+            let client = MockSummaryClient::success(summary);
+            assert!(
+                generate_inline_summary(
+                    &[],
+                    &history,
+                    InlineSummaryHistoryProjection::Semantic,
+                    &client
+                )
+                .await
+                .is_some()
+            );
+            let request = client.recorded_requests().pop().unwrap();
+            let body = build_provider_request_body(
+                &request,
+                &[],
+                "amazon.nova-pro-v1:0",
+                "bedrock",
+                Some(1024),
+                None,
+                false,
+                &ThinkingConfig::Off,
+            );
+            assert_eq!(body["messages"][0]["role"], "user");
+            assert_eq!(body["messages"][1]["role"], "assistant");
+            assert_eq!(body["messages"][2]["role"], "user");
+            assert!(
+                body["messages"][1]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("PRIOR_FACT")
+            );
+        }
     }
 
     #[test]
@@ -19437,6 +19717,74 @@ mod tests {
             second_wire[2]["reasoning_content"], "first decision",
             "historical reasoning must not be rewritten after a later response"
         );
+    }
+
+    #[test]
+    fn glm_exact_captured_replay_is_shared_by_streaming_nonstreaming_and_cache_projection() {
+        use astra_turn_core::cache_placement::{
+            CacheProtocol, CacheReuseScope, VolatileDeliveryPolicy,
+        };
+        use astra_turn_core::thinking_config::ThinkingEffort;
+        let append_only = CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(CacheReuseScope::IntraTurnRounds),
+        };
+        let messages = vec![
+            json!({"role":"user", "content":"request"}),
+            json!({"role":"assistant", "content":"first", "reasoning_content":" original\n\t", "reasoning_signature":"original-signature"}),
+            json!({"role":"assistant", "content":"missing original"}),
+            json!({"role":"assistant", "content":"empty", "reasoning_content":""}),
+            json!({"role":"assistant", "content":"space", "reasoning_content":" \t"}),
+            json!({"role":"assistant", "content":"last", "reasoning_content":"last original"}),
+        ];
+        for streaming in [false, true] {
+            for thinking in [
+                ThinkingConfig::Off,
+                ThinkingConfig::Adaptive {
+                    effort: ThinkingEffort::Low,
+                },
+                ThinkingConfig::Adaptive {
+                    effort: ThinkingEffort::Max,
+                },
+            ] {
+                for capability in [None, Some(append_only)] {
+                    let body = build_provider_request_body_with_cache_capability(
+                        &messages,
+                        &[],
+                        "glm-5.3",
+                        "openai",
+                        Some(128),
+                        None,
+                        streaming,
+                        &thinking,
+                        None,
+                        capability,
+                    );
+                    assert_eq!(body["messages"], json!(messages));
+                    assert_eq!(body["stream"], streaming);
+                    let mut extended = messages.clone();
+                    extended.push(json!({"role":"user", "content":"next"}));
+                    let next = build_provider_request_body_with_cache_capability(
+                        &extended,
+                        &[],
+                        "glm-5.3",
+                        "openai",
+                        Some(128),
+                        None,
+                        streaming,
+                        &thinking,
+                        None,
+                        capability,
+                    );
+                    assert_eq!(
+                        &next["messages"].as_array().unwrap()[..messages.len()],
+                        messages.as_slice()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

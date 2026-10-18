@@ -156,21 +156,23 @@ impl ProviderDispatchBudget {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ProviderAttemptBoundary {
-    convergence: bool,
+    recovery: bool,
+    suppressed_recovery: bool,
     no_tools: bool,
 }
 
 impl ProviderAttemptBoundary {
-    fn new(convergence: bool, no_tools: bool) -> Self {
+    fn new(recovery: bool, no_tools: bool) -> Self {
         Self {
-            convergence,
+            recovery,
+            suppressed_recovery: false,
             no_tools,
         }
     }
 
     fn budget(self) -> Option<Duration> {
-        self.convergence
-            .then_some(astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET)
+        self.suppressed_recovery
+            .then_some(astra_turn_core::chat_turn_heuristics::SUPPRESSED_PROVIDER_RECOVERY_BUDGET)
     }
 
     fn provider_work_budget(self, execution: Option<ProviderWorkBudget>) -> Option<Duration> {
@@ -182,12 +184,25 @@ impl ProviderAttemptBoundary {
         }
     }
 
-    fn forces_thinking_off(self) -> bool {
-        self.convergence
+    fn with_generation_control(
+        mut self,
+        thinking: &ThinkingConfig,
+        config: &ResolvedTurnLlmConfig,
+    ) -> Self {
+        self.suppressed_recovery = self.recovery
+            && thinking.is_off()
+            && thinking.is_supported_by(
+                &config.provider,
+                config
+                    .thinking_capability
+                    .map(|capability| capability.as_str()),
+                config.thinking_protocol.unwrap_or_default(),
+            );
+        self
     }
 
     fn allows_host_continuation(self) -> bool {
-        !self.convergence
+        !self.recovery
     }
 }
 
@@ -222,7 +237,7 @@ fn provider_result_has_valid_tool_call(result: &LlmCallResult) -> bool {
 /// reasoning.  That is not a settled assistant response: no text has become
 /// visible and no tool has been selected.  Preserve this distinction even on
 /// ordinary (non-convergence) calls so the loop can take its single safe
-/// thinking-off recovery rather than presenting an empty completion as
+/// capability-aware recovery rather than presenting an empty completion as
 /// success.
 ///
 /// A selected tool deliberately does *not* qualify here, including one that
@@ -485,7 +500,7 @@ fn validate_provider_convergence_result(
                         "deadline": {
                             "scope": "provider_convergence",
                             "phase": "actionable_output",
-                            "limit_ms": astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET.as_millis() as u64,
+                            "limit_ms": boundary.budget().map(|budget| budget.as_millis() as u64),
                             "actionable_output": false,
                             "retry_safety": "none"
                         },
@@ -943,21 +958,29 @@ fn primary_thinking_for_attempt(
     final_answer_settlement_text_only: bool,
     provider_attempt_boundary: ProviderAttemptBoundary,
     cache_protocol: astra_turn_core::cache_placement::CacheProtocol,
+    config: &ResolvedTurnLlmConfig,
 ) -> ThinkingConfig {
-    if preserve_thinking {
+    if preserve_thinking || matches!(state_thinking, ThinkingConfig::Enabled { .. }) {
         return state_thinking.clone();
     }
-    if canonical_work_establishment_pending || provider_attempt_boundary.forces_thinking_off() {
-        return ThinkingConfig::Off;
-    }
-    if final_answer_settlement_text_only
+    let uncached_final = final_answer_settlement_text_only
         && !matches!(
             cache_protocol,
             astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix
                 | astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch
-        )
+        );
+    if canonical_work_establishment_pending || provider_attempt_boundary.recovery || uncached_final
     {
-        return ThinkingConfig::Off;
+        let bounded = ThinkingConfig::bounded_auxiliary(
+            &config.provider,
+            config
+                .thinking_capability
+                .map(|capability| capability.as_str()),
+            config.thinking_protocol.unwrap_or_default(),
+        );
+        if bounded != ThinkingConfig::ModelDefault {
+            return bounded;
+        }
     }
     state_thinking.clone()
 }
@@ -1216,10 +1239,9 @@ fn apply_pre_turn_summary(
     let candidate = crate::turn::cloud::compaction::prepare_prefix_summary(
         &state.messages,
         spill_count,
-        serde_json::json!({
-            "role": "system",
-            "content": format!("[Conversation compacted — {} messages summarized]\n\n{}", spill_count, summary_text),
-        }),
+        astra_turn_core::cloud::history_summary::history_summary_message(format!(
+            "[Conversation compacted — {spill_count} messages summarized]\n\n{summary_text}"
+        )),
         state.pinned_tool_schema_tokens as usize,
         max_tokens,
         crate::prompts::measured_prompt_tokens_from_manifest(
@@ -3943,6 +3965,10 @@ pub struct ServerAgenticLoopHost {
     test_judgment_clients:
         std::collections::VecDeque<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>>,
 
+    /// Inject only the inference boundary in offline compaction regressions.
+    #[cfg(test)]
+    test_compaction_client: Option<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>>,
+
     // ── Fork-prefix parent capture (G2) ──
     /// Optional fork-prefix store. When wired, `on_turn_completed`
     /// captures the parent turn's
@@ -6280,6 +6306,8 @@ impl ServerAgenticLoopHostBuilder {
             memoria_client: self.memoria_client,
             #[cfg(test)]
             test_judgment_clients: self.test_judgment_clients,
+            #[cfg(test)]
+            test_compaction_client: None,
             prefix_store: self.prefix_store,
             last_turn_tool_schemas: Vec::new(),
             disabled_tool_offers: self
@@ -10177,7 +10205,6 @@ impl ServerAgenticLoopHost {
                 matches!(
                     window.action,
                     crate::turn::agentic_loop::host::CompletionAction::RequiredWorkspaceMutation
-                        | crate::turn::agentic_loop::host::CompletionAction::RequiredExternalEffect
                 )
             })
         {
@@ -11818,6 +11845,23 @@ impl ServerAgenticLoopHost {
         self.remember_resolved_llm_config(&llm_cfg);
         self.durable_summary_client(&llm_cfg, max_output_tokens, state, operation_id)
             .map(|client| Box::new(client) as Box<_>)
+    }
+
+    fn pre_turn_summary_client(
+        &mut self,
+        config: &ResolvedTurnLlmConfig,
+        state: &AgenticLoopState,
+        tools: Vec<Value>,
+        cache_capability: astra_turn_core::cache_placement::CacheCapability,
+    ) -> Option<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>> {
+        #[cfg(test)]
+        if let Some(client) = self.test_compaction_client.take() {
+            return Some(client);
+        }
+        Some(Box::new(
+            self.durable_summary_client(config, 4096, state, "pre_turn_compaction")?
+                .with_prompt_cache_context(tools, cache_capability),
+        ))
     }
 
     fn durable_summary_client(
@@ -17747,7 +17791,7 @@ impl ServerAgenticLoopHost {
     /// does this inline, so we expose the same signal here for parity.
     async fn compact_messages_via_memoria(
         &self,
-        state: &AgenticLoopState,
+        state: &mut AgenticLoopState,
         messages: &[Value],
         system_messages: &[Value],
         visible_tools: &[Value],
@@ -17761,18 +17805,51 @@ impl ServerAgenticLoopHost {
             state,
             "required_compaction",
         );
+        let summary_client = summary_client
+            .as_ref()
+            .map(|client| client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient);
+        #[cfg(test)]
+        let summary_client = self.test_compaction_client.as_deref().or(summary_client);
         let ctx = crate::turn::wire_assembly::MemoriaContext {
             session_id: &self.session_id,
             model_name: &llm_cfg.model_name,
             context_window: llm_cfg.context_window,
             memoria_client: self.memoria_client.as_deref(),
-            summary_client: summary_client
-                .as_ref()
-                .map(|client| client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
+            summary_client,
             tier,
             session_facts: None,
         };
-        ctx.compact(messages, system_messages, visible_tools).await
+        let mut result = ctx.compact(messages, system_messages, visible_tools).await;
+        // Admission owns canonical rewrite authority. Without a valid permit,
+        // retain the request-local result and the existing WAL predecessor.
+        if let Some(candidate) = crate::turn::cloud::compaction::prepare_request_summary(
+            &state.messages,
+            messages,
+            &result,
+        ) && let Some(rewrite_permit) = state
+            .begin_canonical_rewrite()
+            .filter(|permit| permit.is_valid())
+        {
+            // Install only after all summary I/O and validation finish. Dropping
+            // the future cannot install a partially generated representation.
+            // The canonical WAL/terminal commit already persists this rewrite;
+            // no extra memory write or checkpoint table belongs here.
+            result.messages.retain(|message| {
+                astra_turn_core::cloud::history_summary::history_summary_text(message).is_none()
+            });
+            result.messages.insert(0, candidate[0].clone());
+            result.history_summary = None;
+            if let Some(boundary) = result.boundary.as_mut() {
+                boundary.messages_after = result.messages.len();
+            }
+            state.messages = candidate;
+            // execute_turn_and_ingest_phase captured this prefix before
+            // request preparation. Rebase its microcompact protection count
+            // onto the accepted history, leaving later tool results eligible.
+            state.last_request_message_count = Some(state.messages.len());
+            state.finish_canonical_rewrite(Some(rewrite_permit));
+        }
+        result
     }
 
     /// Assemble the final provider wire once, then perform at most one pure
@@ -20484,10 +20561,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // provider-visible history that will be stitched below.  The
         // canonical state may retain frames that Memoria omitted here.
         let mut compacted_messages = compact_result.messages;
-        final_volatile_preamble.extend(compact_result.runtime_contexts.iter().filter_map(
+        final_volatile_preamble.extend(compact_result.history_summary.iter().filter_map(
             |context| {
                 crate::turn::wire_assembly::required_runtime_preamble_message(
-                    context,
+                    &format!("## Compacted Conversation Summary\n{context}"),
                     crate::turn::wire_assembly::RuntimeAuthorityKind::CompactedConversationSummary,
                     astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
                 )
@@ -20740,9 +20817,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // only selects deterministic execution behavior after that decision.
         let canonical_work_establishment_pending =
             !final_answer_settlement_text_only && self.canonical_work_establishment_pending(state);
-        let force_provider_convergence = state.provider_adaptation.force_next_thinking_off;
+        let safe_provider_recovery = state.provider_adaptation.safe_recovery_pending;
         let provider_attempt_boundary =
-            ProviderAttemptBoundary::new(force_provider_convergence, use_no_tool_choice);
+            ProviderAttemptBoundary::new(safe_provider_recovery, use_no_tool_choice);
         let primary_thinking = primary_thinking_for_attempt(
             &state.thinking,
             self.preserve_thinking,
@@ -20750,7 +20827,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             final_answer_settlement_text_only,
             provider_attempt_boundary,
             cache_cap.protocol,
+            &llm_cfg,
         );
+        let provider_attempt_boundary =
+            provider_attempt_boundary.with_generation_control(&primary_thinking, &llm_cfg);
 
         // Output token recovery: if finish_reason is "length", make at most
         // one catalog/context-valid probe. Never turn an already authoritative
@@ -21285,7 +21365,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             let attempt_label = llm_main_attempt_label(attempt_in_round);
             state
                 .step_recorder
-                .begin_llm_round(&llm_cfg.model_name, state.inference_purpose);
+                .begin_llm_round(&llm_cfg.model_name, state.inference_purpose, durable_invocation.invocation_id(), attempt_in_round);
             if attempt_in_round > 0 {
                 state.current_model_item_id = Some(uuid::Uuid::new_v4().to_string());
                 self.current_model_item_id = state.current_model_item_id.clone();
@@ -21293,6 +21373,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 streamed_reasoning.clear();
             }
             let llm_round_start = std::time::Instant::now();
+            tracing::info!(
+                target: "astra::provider_recovery",
+                safe_recovery = safe_provider_recovery,
+                requested_thinking = %state.thinking,
+                effective_thinking = %primary_thinking,
+                provider_work_budget_ms = ?dispatch_budget.client_timeout.map(|budget| budget.as_millis()),
+                "primary generation controls resolved against admitted capability"
+            );
             self.on_turn_phase_started(
                 state,
                 TurnPhaseKind::ModelInference,
@@ -21555,29 +21643,58 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 }
                 provider_result
             };
-            if state.messaging.progress_emitter.is_none() {
-                self.emit_progress_event(json!({
-                    "type": "agent_progress",
-                    "status": "llm_call_completed",
-                    "turn": state.llm_rounds_completed,
-                    "ttft_ms": attempt_first_stream_update_ms,
-                    "duration_ms": llm_round_start.elapsed().as_millis() as u64,
-                }));
-            }
-            self.publish_explain_analyze_provider_attempt_spans(
-                explain_provider_attempt_observer.drain_spans(),
-            );
+            let llm_round_latency_ms = llm_round_start.elapsed().as_millis() as u64;
             let provider_attempts = durable_invocation.provider_attempt_facts().await;
+            let mut qualified_invocation_usage: Option<astra_turn_types::CanonicalTokenUsage> = None;
             // The invocation's final facts are read once after its call has
             // stopped. Each request key is unique in its existing owner map.
             for usage in provider_attempts.iter().filter_map(|fact| fact.qualified_usage) {
-                qualified_attempt_usage = Some(match qualified_attempt_usage {
+                qualified_invocation_usage = Some(match qualified_invocation_usage {
                     None => usage,
                     Some(total) => total.checked_add(usage).unwrap_or_else(|_| {
                         astra_turn_types::CanonicalTokenUsage::new(None, None, None, None).expect("unknown usage is valid")
                     }),
                 });
             }
+            if let Some(usage) = qualified_invocation_usage {
+                qualified_attempt_usage = Some(match qualified_attempt_usage {
+                    None => usage,
+                    Some(total) => total.checked_add(usage).unwrap_or_else(|_| {
+                        astra_turn_types::CanonicalTokenUsage::new(None, None, None, None)
+                            .expect("unknown usage is valid")
+                    }),
+                });
+            }
+            // A Step terminal describes this invocation only. The outer error
+            // projection may also include earlier logical continuations.
+            let r = r.map_err(|error| attach_qualified_error_usage(error, qualified_invocation_usage));
+            match &r {
+                Ok(response) => {
+                    let usage = crate::turn::token_usage::TokenUsage::from_partial_json_map(&response.usage);
+                    state.step_recorder.end_llm_round(
+                        &llm_cfg.model_name, state.inference_purpose,
+                        usage.input_tokens, usage.output_tokens, usage.cached_input_tokens,
+                        usage.cache_creation_tokens, llm_round_latency_ms,
+                    );
+                }
+                Err(error) => state.step_recorder.fail_llm_round(
+                    &llm_cfg.model_name, state.inference_purpose, error,
+                    llm_round_latency_ms,
+                    durable_invocation.provider_dispatch_started(),
+                ),
+            }
+            if state.messaging.progress_emitter.is_none() {
+                self.emit_progress_event(json!({
+                    "type": "agent_progress",
+                    "status": "llm_call_completed",
+                    "turn": state.llm_rounds_completed,
+                    "ttft_ms": attempt_first_stream_update_ms,
+                    "duration_ms": llm_round_latency_ms,
+                }));
+            }
+            self.publish_explain_analyze_provider_attempt_spans(
+                explain_provider_attempt_observer.drain_spans(),
+            );
             match (
                 durable_invocation.admitted_canonical_transition_id(),
                 provider_canonical_planned_head,
@@ -21619,8 +21736,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             }
             record_provider_attempt_cache_observations(state, &provider_attempts);
             if durable_invocation.provider_dispatch_started() {
-                if force_provider_convergence {
-                    state.provider_adaptation.force_next_thinking_off = false;
+                if safe_provider_recovery {
+                    state.provider_adaptation.safe_recovery_pending = false;
                 }
                 durable_canonical_cursor = state.messages.len();
                 record_full_llm_request_event(
@@ -21703,6 +21820,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     &final_tools,
                 );
             }
+
 
             // Context-window errors flow through the accum so the agentic loop's
             // Fatal handler can trigger auto-compaction + retry.
@@ -21954,21 +22072,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     admission_estimated_tokens as u64,
                     &r.usage,
                 );
-                state.step_recorder.end_llm_round(
-                    &llm_cfg.model_name,
-                    state.inference_purpose,
-                    u.input_tokens,
-                    u.output_tokens,
-                    u.cached_input_tokens,
-                    u.cache_creation_tokens,
-                    llm_round_start.elapsed().as_millis() as u64,
-                );
+
             }
 
             // A convergence attempt is one logical provider request, not a
             // new retry budget. Its durable attempt is already settled above;
             // do not let host-level work-establishment, output-cap, or length
-            // continuations silently turn the 30s slice into 60s or more.
+            // continuations create additional logical recovery requests.
             // The returned response still follows the ordinary admission and
             // tool-execution path after this provider loop.
             if !provider_attempt_boundary.allows_host_continuation() {
@@ -22714,6 +22824,28 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         result
     }
 
+    fn on_provider_recovery(&mut self, state: &AgenticLoopState, reason: astra_core::ErrorKind) {
+        self.emit_progress_event(json!({
+            "type": "warning",
+            "code": "provider_recovery",
+            "model": state.current_model_identity(),
+            "error_kind": reason.as_str(),
+            "attempt": 1,
+            "message": format!("{} did not produce a usable response. Attempting one recovery with the retained conversation and tool evidence.", state.current_model_identity().unwrap_or("The selected model")),
+        }));
+    }
+
+    fn emit_hook_config_diagnostic(
+        &mut self,
+        diagnostic: &crate::skills::hooks::HookConfigDiagnostic,
+    ) {
+        self.emit_progress_event(json!({
+            "type": "warning",
+            "code": "hook_configuration",
+            "message": diagnostic.to_string(),
+        }));
+    }
+
     fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
         self.emit_progress_event(json!({
             "type": "headless_line",
@@ -22812,9 +22944,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             // select a different schema prefix and defeat inline reuse.
             state.sticky_tool_schemas.clone()
         };
-        let client = self
-            .durable_summary_client(&config, 4096, state, "pre_turn_compaction")?
-            .with_prompt_cache_context(summary_tools, cache_capability);
+        let client =
+            self.pre_turn_summary_client(&config, state, summary_tools, cache_capability)?;
         let spill_count = pre_turn_summary_spill_count(&state.messages);
         if spill_count == 0 {
             state.compaction_effectiveness.record_futile();
@@ -22837,7 +22968,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             } else {
                 astra_turn_core::cloud_summary::InlineSummaryHistoryProjection::Semantic
             },
-            &client,
+            client.as_ref(),
         )
         .await
         {
@@ -22901,7 +23032,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         };
         let model_id = self.model_override.clone().unwrap_or_default();
         let provider = astra_turn_core::fork_prefix::ProviderKind::from_provider_hint(&model_id);
-        let raw_provider = provider.raw_provider_name().to_owned();
+        // Replay capability follows admitted upstream identity. The display
+        // alias remains the existing fork/cache identity and grants no wire capability.
+        let (replay_provider, replay_model) = self
+            .admitted_model_execution
+            .as_ref()
+            .map(|execution| (execution.provider.as_str(), execution.upstream_model_name()))
+            .unwrap_or(("", ""));
         let canonical_prefix_bytes = match serde_json::to_vec(&state.messages) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -22936,8 +23073,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             model_id: model_id.clone(),
             thinking: astra_turn_core::thinking_config::fork_capture_thinking_slice(
                 &state.thinking,
-                &raw_provider,
-                &model_id,
+                replay_provider,
+                replay_model,
             ),
             system_blocks: vec![],
             tool_schemas,
@@ -23845,6 +23982,8 @@ mod tests {
         assert!(texts[1].contains("No provider-owned collaborator is currently advertised"));
     }
 
+    include!("server_loop_host_replay_tests.rs");
+
     fn test_host_builder(
         user_id: impl Into<String>,
         session_id: impl Into<String>,
@@ -24257,9 +24396,16 @@ mod tests {
             ),
             (
                 Some(test_execution_deadline(600)),
+                ProviderAttemptBoundary::new(true, false)
+                    .with_generation_control(&ThinkingConfig::Off, &nonthinking_test_config()),
+                false,
+                false,
+            ),
+            (
+                Some(test_execution_deadline(600)),
                 ProviderAttemptBoundary::new(true, false),
                 false,
-                false,
+                true,
             ),
             (
                 Some(test_execution_deadline(20)),
@@ -24352,14 +24498,15 @@ mod tests {
 
     #[test]
     fn execution_provider_work_budget_and_convergence_choose_the_smaller_slice() {
-        let convergence = ProviderAttemptBoundary::new(true, false);
+        let convergence = ProviderAttemptBoundary::new(true, false)
+            .with_generation_control(&ThinkingConfig::Off, &nonthinking_test_config());
         assert_eq!(
             convergence.provider_work_budget(Some(ProviderWorkBudget(Duration::from_secs(5)))),
             Some(Duration::from_secs(5))
         );
         assert_eq!(
             convergence.provider_work_budget(Some(ProviderWorkBudget(Duration::from_secs(60)))),
-            Some(astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET)
+            Some(astra_turn_core::chat_turn_heuristics::SUPPRESSED_PROVIDER_RECOVERY_BUDGET)
         );
     }
 
@@ -26419,7 +26566,7 @@ mod tests {
                 // Preserve the final-answer window while exercising a local
                 // approval timeout before durable reconciliation.
                 remaining_seconds:
-                    astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET
+                    astra_turn_core::chat_turn_heuristics::SUPPRESSED_PROVIDER_RECOVERY_BUDGET
                         .as_secs()
                         + 2,
             }))
@@ -29205,6 +29352,12 @@ mod tests {
             timeout_ms,
             128_000,
         )
+    }
+
+    fn nonthinking_test_config() -> ResolvedTurnLlmConfig {
+        let mut config = summary_test_config(String::new());
+        config.thinking_capability = Some(astra_services::models::ThinkingCapability::None);
+        config
     }
 
     fn summary_test_config(base_url: String) -> ResolvedTurnLlmConfig {
@@ -35155,9 +35308,10 @@ mod tests {
     fn provider_convergence_boundary_is_one_shot_text_only_and_bounded() {
         let no_tools = HashSet::new();
         let work_tools = HashSet::from(["start_work".to_string()]);
-        let text_only = ProviderAttemptBoundary::new(true, true);
+        let text_only = ProviderAttemptBoundary::new(true, true)
+            .with_generation_control(&ThinkingConfig::Off, &nonthinking_test_config());
         assert_eq!(text_only.budget(), Some(Duration::from_secs(30)));
-        assert!(text_only.forces_thinking_off());
+        assert!(text_only.recovery);
         assert!(text_only.no_tools);
         assert!(
             !text_only.allows_host_continuation(),
@@ -35166,7 +35320,7 @@ mod tests {
 
         let ordinary = ProviderAttemptBoundary::new(false, false);
         assert_eq!(ordinary.budget(), None);
-        assert!(!ordinary.forces_thinking_off());
+        assert!(!ordinary.recovery);
         assert!(!ordinary.no_tools);
         assert!(ordinary.allows_host_continuation());
 
@@ -36876,6 +37030,33 @@ mod tests {
     }
 
     #[test]
+    fn hook_config_diagnostics_emit_a_safe_client_warning() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".astra")).unwrap();
+        std::fs::write(
+            root.path().join(".astra/hooks.json"),
+            r#"{"hooks":[{"event":"pre_tool_use","matchr":"SECRET_MATCHER","action":{"type":"http","url":"https://invalid.example/SECRET","headers":{"Authorization":"SECRET_HEADER"}}}]}"#,
+        )
+        .unwrap();
+        let (tools, _) = crate::skills::hooks::load_all_hooks(root.path());
+        let diagnostic = tools.take_config_diagnostics().pop().unwrap();
+        let mut host = test_host_builder("u", "s").build();
+        host.emit_hook_config_diagnostic(&diagnostic);
+        assert_eq!(host.emitted_events.len(), 1);
+        let projected =
+            astra_services::runs::transform_run_event_for_client(host.emitted_events[0].clone());
+        assert_eq!(projected["type"], "warning");
+        assert_eq!(projected["code"], "hook_configuration");
+        assert_eq!(projected["message"], diagnostic.to_string());
+        assert!(!projected.to_string().contains("SECRET"));
+        assert!(
+            !projected
+                .to_string()
+                .contains(root.path().to_str().unwrap())
+        );
+    }
+
+    #[test]
     fn runtime_feedback_is_projected_without_recomputing_the_frame() {
         let mut host = test_host_builder("u", "s").build();
         let frame: astra_turn_core::context_feedback::RuntimeFeedbackFrame =
@@ -37775,6 +37956,858 @@ mod tests {
         );
     }
 
+    struct ContinuitySummaryClient {
+        requests: Arc<std::sync::Mutex<Vec<Vec<Value>>>>,
+    }
+
+    const CONTINUITY_FACT: &str = "HISTORICAL_CONSTRAINT_SENTINEL_42";
+
+    #[async_trait::async_trait]
+    impl SummaryLlmClient for ContinuitySummaryClient {
+        async fn summarize(
+            &self,
+            purpose: astra_turn_types::InferencePurpose,
+            messages: &[Value],
+        ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, astra_core::ClassifiedError>
+        {
+            assert_eq!(
+                purpose,
+                astra_turn_types::InferencePurpose::RequiredCompaction
+            );
+            self.requests.lock().unwrap().push(messages.to_vec());
+            // A replacement can retain the fact only when the actual request
+            // supplied it. Structural validity alone must not make this pass.
+            let fact = if serde_json::to_string(messages)
+                .unwrap()
+                .contains(CONTINUITY_FACT)
+            {
+                CONTINUITY_FACT
+            } else {
+                "historical constraint was unavailable"
+            };
+            Ok(astra_turn_core::cloud_summary::SummaryResponse {
+                text: format!(
+                    "### Primary Request\n{fact}\n### Pending Tasks\nFinish\n### Current Work\nImplementation\n### Current State\nIn progress"
+                ),
+                is_ptl_error: false,
+                model_used: "recording-fixture".into(),
+                finish_reason: Some("stop".into()),
+                usage: Map::new(),
+                qualified_usage: None,
+                judgment_provenance: None,
+                execution: None,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct CompactionMemoryFixture {
+        sessions: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::turn::cloud::memoria_compact::MemoriaPort for CompactionMemoryFixture {
+        async fn retrieve_ext(
+            &self,
+            _query: &str,
+            session_id: Option<&str>,
+            _top_k: usize,
+            filter_session: bool,
+        ) -> Result<
+            Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>,
+            astra_memoria::MemoriaOperationError,
+        > {
+            assert!(filter_session);
+            self.sessions
+                .lock()
+                .unwrap()
+                .push(session_id.unwrap().into());
+            Ok(Vec::new())
+        }
+
+        async fn store(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<String, String> {
+            panic!("request compaction must not create a memory write")
+        }
+
+        async fn purge_working(&self, _: &str) -> Result<u64, String> {
+            panic!("request compaction must not purge memory")
+        }
+    }
+
+    fn compaction_reuse_history(fact: &str, generation: usize) -> Vec<Value> {
+        let mut history = vec![
+            astra_turn_core::cloud::history_summary::history_summary_message(fact.into()),
+            json!({"role":"system", "content":"STABLE_POLICY_DO_NOT_SUMMARIZE"}),
+            json!({"role":"user", "content":format!("Inspect generation {generation}")}),
+        ];
+        for round in 0..80 {
+            append_compaction_tool_pair(
+                &mut history,
+                &format!("large-{generation}-{round}"),
+                &format!(
+                    "EVIDENCE_{generation}_{round}: {}",
+                    "observed file content ".repeat(300)
+                ),
+            );
+        }
+        history.push(json!({"role":"user", "content":format!("Continue generation {generation}")}));
+        history.push(
+            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                &format!("CONTROL_{generation}"),
+                crate::turn::wire_assembly::RuntimeAuthorityKind::ActiveWorkAttemptStart,
+                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+            )
+            .unwrap()
+            .unwrap(),
+        );
+        history
+    }
+
+    fn append_compaction_tool_pair(history: &mut Vec<Value>, id: &str, content: &str) {
+        history.extend([
+            json!({"role":"assistant", "tool_calls":[{"id":id,"type":"function","function":{"name":"read_file","arguments":"{}"}}]}),
+            json!({"role":"tool", "tool_call_id":id,"content":content}),
+        ]);
+    }
+
+    fn compaction_reuse_config(append_only: bool) -> ResolvedTurnLlmConfig {
+        use astra_turn_core::cache_placement::{CacheCapability, VolatilePlacement};
+        let mut config = summary_test_config("http://127.0.0.1:1/unused".into());
+        config.context_window = Some(32_000);
+        config.max_completion_tokens = Some(4_000);
+        config.cache_capability = Some(CacheCapability {
+            volatile_placement: if append_only {
+                VolatilePlacement::AppendOnlyUserTail
+            } else {
+                VolatilePlacement::TailSuffix
+            },
+            ..CacheCapability::for_provider("openai")
+        });
+        config
+    }
+
+    #[tokio::test]
+    async fn request_compaction_reuses_accepted_history_across_rounds_and_resume() {
+        use astra_turn_core::cloud::history_summary::history_summary_text;
+        for append_only in [false, true] {
+            let memory = Arc::new(CompactionMemoryFixture::default());
+            let mut host = test_host_builder("reuse-owner", "reuse-session")
+                .with_memoria_client(Some(memory.clone()))
+                .build();
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            host.test_compaction_client = Some(Box::new(ContinuitySummaryClient {
+                requests: requests.clone(),
+            }));
+            let config = compaction_reuse_config(append_only);
+            let mut state = create_test_state();
+            state.current_session_id = Some("reuse-session".into());
+            state.max_turn_input_tokens = 28_000;
+            state.messages = compaction_reuse_history(CONTINUITY_FACT, 0);
+            let initial_bytes = serde_json::to_vec(&state.messages).unwrap().len();
+            let initial_pressure =
+                crate::turn::agentic_loop::lifecycle::estimate_context_pressure_for_state(&state).0;
+            for generation in 0..3 {
+                if generation == 2 {
+                    assert!(state.compact_tier_applied >= CompactionTier::CompactHistory);
+                }
+                if generation > 0 {
+                    // Newly covered evidence must trigger fresh work. Keep the
+                    // accepted summary, then append a new real user/history span.
+                    let new_history = compaction_reuse_history("unused", generation);
+                    state.messages.extend_from_slice(&new_history[2..]);
+                }
+                let admitted = state.messages.clone();
+                state.initialize_canonical_rewrite_proof(
+                    &admitted,
+                    &astra_turn_types::canonical_conversation_root(&admitted),
+                    generation as u64,
+                );
+                state.initialize_provider_canonical_wal_base(&admitted);
+                let mut first_tier = CompactionTier::Normal;
+                for round in 0..8 {
+                    state.current_round_index = round;
+                    state.llm_rounds_completed = round;
+                    state.last_request_message_count = Some(state.messages.len());
+                    let pipeline = host
+                        .run_turn_pipeline_with_model_limits_and_session_memory(
+                            &mut state,
+                            &[],
+                            &config.provider,
+                            &config.model_name,
+                            config.context_window,
+                            config.max_completion_tokens,
+                            config.cache_capability,
+                            None,
+                            &[],
+                            "continue",
+                        )
+                        .unwrap();
+                    if round == 0 {
+                        first_tier = pipeline.tier;
+                    }
+                    let mut fixed = pipeline.system_messages;
+                    fixed.extend(pipeline.volatile_preamble);
+                    let result = host
+                        .compact_messages_via_memoria(
+                            &mut state,
+                            &pipeline.messages,
+                            &fixed,
+                            &[],
+                            pipeline.tier,
+                            &config,
+                        )
+                        .await;
+                    let observations: Vec<_> =
+                        crate::turn::wire_assembly::observe_context_compaction(
+                            format!("reuse:{generation}:{round}"),
+                            CompactionKind::WireAssembly,
+                            &pipeline.messages,
+                            &result,
+                            &fixed,
+                            &[],
+                            None,
+                        )
+                        .into_iter()
+                        .collect();
+                    crate::turn::agentic_loop::execution_phase::record_context_compactions(
+                        &mut host,
+                        &mut state,
+                        &observations,
+                    );
+                    assert_eq!(
+                        requests.lock().unwrap().len(),
+                        generation + 1,
+                        "append_only={append_only}, generation={generation}, round={round}"
+                    );
+                    if round == 0 {
+                        // Provider-attempt WAL admission must accept the same rewrite
+                        // proof before a later terminal canonical commit.
+                        let durable_base = state.provider_canonical_wal_base.as_ref().unwrap();
+                        let authorization = state
+                            .provider_canonical_replacement_authorization(
+                                durable_base,
+                                &state.messages,
+                            )
+                            .unwrap();
+                        let plan = plan_provider_canonical_wal_transition(
+                            durable_base,
+                            None,
+                            &state.messages,
+                            Vec::new(),
+                            Some(&authorization),
+                            ProviderCanonicalWalLimits::PRODUCTION,
+                        )
+                        .unwrap();
+                        assert!(plan.transition.replacement_compaction_generation.is_some());
+                        assert!(result.boundary.is_some());
+                        assert_eq!(state.last_request_message_count, Some(state.messages.len()));
+                        assert!(
+                            result.history_summary.is_none(),
+                            "accepted summary belongs to canonical history"
+                        );
+                    } else {
+                        assert!(
+                            result.boundary.is_none(),
+                            "small tool rounds must reuse the accepted working set"
+                        );
+                        assert!(
+                            pipeline.tier < first_tier,
+                            "pressure must use the effective history"
+                        );
+                    }
+                    assert!(
+                        history_summary_text(&result.messages[0])
+                            .unwrap()
+                            .contains(CONTINUITY_FACT),
+                        "the current provider request must receive the accepted summary too"
+                    );
+                    assert_eq!(
+                        state
+                            .messages
+                            .iter()
+                            .filter(|m| history_summary_text(m).is_some())
+                            .count(),
+                        1
+                    );
+                    assert!(
+                        history_summary_text(&state.messages[0])
+                            .unwrap()
+                            .contains(CONTINUITY_FACT)
+                    );
+                    assert!(
+                        state
+                            .messages
+                            .iter()
+                            .any(|m| m["content"] == format!("Continue generation {generation}"))
+                    );
+                    astra_turn_types::validate_canonical_tool_pairing(&state.messages).unwrap();
+                    // One unchanged round and six small tool rounds per generation.
+                    if round > 0 {
+                        append_compaction_tool_pair(
+                            &mut state.messages,
+                            &format!("small-{generation}-{round}"),
+                            &format!("NEW_SMALL_EVIDENCE_{generation}_{round}"),
+                        );
+                    }
+                }
+                assert!(
+                    crate::turn::agentic_loop::lifecycle::estimate_context_pressure_for_state(
+                        &state
+                    )
+                    .0 < initial_pressure
+                );
+                let accepted_bytes = serde_json::to_vec(&state.messages).unwrap().len();
+                assert!(accepted_bytes < initial_bytes / 4);
+                let request =
+                    serde_json::to_string(requests.lock().unwrap().last().unwrap()).unwrap();
+                assert!(request.contains(CONTINUITY_FACT));
+                assert!(request.contains(&format!("EVIDENCE_{generation}_79")));
+                assert!(!request.contains("STABLE_POLICY_DO_NOT_SUMMARIZE"));
+                assert!(!request.contains(&format!("CONTROL_{generation}")));
+                assert!(
+                    !request.contains(&format!("NEW_SMALL_EVIDENCE_{generation}_1")),
+                    "summary coverage must stop at the accepted input"
+                );
+                if generation > 0 {
+                    assert!(request.contains(&format!("NEW_SMALL_EVIDENCE_{}_1", generation - 1)));
+                }
+                // Exercise the real canonical commit + restore, not a bespoke
+                // cache serialization. The next generation uses a fresh state.
+                let (mode, packs) = crate::turn::canonical_commit::canonical_commit_delta(
+                    &admitted,
+                    true,
+                    &state.messages,
+                    state.canonical_rewrite_proof(),
+                    false,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Replace);
+                let restored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(packs.into_iter().flatten().collect()).unwrap();
+                assert!(
+                    history_summary_text(&restored[0])
+                        .unwrap()
+                        .contains(CONTINUITY_FACT)
+                );
+                let mut fresh = create_test_state();
+                fresh.max_turn_input_tokens = state.max_turn_input_tokens;
+                fresh.current_session_id = state.current_session_id.clone();
+                fresh.messages = restored;
+                if generation != 1 {
+                    state = fresh;
+                }
+                // Resume and the existing high-tier loop both reuse unchanged
+                // history. Generation 2 keeps generation 1's applied tier.
+                let source = state.messages.clone();
+                let result = host
+                    .compact_messages_via_memoria(
+                        &mut state,
+                        &source,
+                        &[],
+                        &[],
+                        CompactionTier::AggressivePrune,
+                        &config,
+                    )
+                    .await;
+                assert!(result.boundary.is_none());
+                assert_eq!(requests.lock().unwrap().len(), generation + 1);
+                eprintln!(
+                    "reuse fixture: append_only={append_only}, generation={generation}, initial_bytes={initial_bytes}, accepted_bytes={accepted_bytes}, summary_calls={}",
+                    requests.lock().unwrap().len()
+                );
+            }
+            assert!(
+                memory
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|s| s == "reuse-session")
+            );
+            // An independent owner/session gets only its own input; no static
+            // summary cache or identity-keyed global state participates.
+            let mut other = test_host_builder("other-owner", "other-session")
+                .with_memoria_client(Some(memory.clone()))
+                .build();
+            let other_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            other.test_compaction_client = Some(Box::new(ContinuitySummaryClient {
+                requests: other_requests.clone(),
+            }));
+            let mut other_state = create_test_state();
+            other_state.messages = compaction_reuse_history("OTHER_OWNER_FACT", 9);
+            let other_source = other_state.messages.clone();
+            other
+                .compact_messages_via_memoria(
+                    &mut other_state,
+                    &other_source,
+                    &[],
+                    &[],
+                    CompactionTier::AggressivePrune,
+                    &config,
+                )
+                .await;
+            let other_request = serde_json::to_string(&*other_requests.lock().unwrap()).unwrap();
+            assert!(!other_request.contains(CONTINUITY_FACT));
+            assert!(other_request.contains("OTHER_OWNER_FACT"));
+        }
+    }
+
+    #[tokio::test]
+    async fn request_local_compaction_baseline_repeats_summary_for_small_rounds() {
+        for append_only in [false, true] {
+            let memory = CompactionMemoryFixture::default();
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let summary = ContinuitySummaryClient {
+                requests: requests.clone(),
+            };
+            let mut host = test_host_builder("reuse-owner", "reuse-session").build();
+            let config = compaction_reuse_config(append_only);
+            let mut state = create_test_state();
+            state.current_session_id = Some("reuse-session".into());
+            state.max_turn_input_tokens = 28_000;
+            state.messages = compaction_reuse_history(CONTINUITY_FACT, 0);
+            for round in 0..8 {
+                state.current_round_index = round;
+                state.llm_rounds_completed = round;
+                let pipeline = host
+                    .run_turn_pipeline_with_model_limits_and_session_memory(
+                        &mut state,
+                        &[],
+                        &config.provider,
+                        &config.model_name,
+                        config.context_window,
+                        config.max_completion_tokens,
+                        config.cache_capability,
+                        None,
+                        &[],
+                        "continue",
+                    )
+                    .unwrap();
+                let mut fixed = pipeline.system_messages;
+                fixed.extend(pipeline.volatile_preamble);
+                let ctx = crate::turn::wire_assembly::MemoriaContext {
+                    session_id: "reuse-session",
+                    model_name: &config.model_name,
+                    context_window: config.context_window,
+                    memoria_client: Some(&memory),
+                    summary_client: Some(&summary),
+                    tier: pipeline.tier,
+                    session_facts: None,
+                };
+                let result = ctx.compact(&pipeline.messages, &fixed, &[]).await;
+                assert!(result.history_summary.is_some());
+                // The old call chain used this result only for the provider
+                // wire. Match the new-path fixture's pipeline, budgets and tail.
+                if round > 0 {
+                    append_compaction_tool_pair(
+                        &mut state.messages,
+                        &format!("small-0-{round}"),
+                        &format!("NEW_SMALL_EVIDENCE_0_{round}"),
+                    );
+                }
+            }
+            assert_eq!(requests.lock().unwrap().len(), 8);
+        }
+    }
+
+    struct InterruptedCompactionSummary {
+        started: Arc<tokio::sync::Notify>,
+        pending: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl SummaryLlmClient for InterruptedCompactionSummary {
+        async fn summarize(
+            &self,
+            _: astra_turn_types::InferencePurpose,
+            _: &[Value],
+        ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, astra_core::ClassifiedError>
+        {
+            self.started.notify_one();
+            if self.pending {
+                std::future::pending::<()>().await;
+            }
+            Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Network,
+                "isolated summary failure",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn request_compaction_without_rewrite_authority_preserves_provider_wal() {
+        for stale_proof in [false, true] {
+            for prior_wal in [true, false] {
+                let memory = Arc::new(CompactionMemoryFixture::default());
+                let mut host = test_host_builder("first-turn-owner", "first-turn-session")
+                    .with_memoria_client(Some(memory))
+                    .build();
+                let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+                host.test_compaction_client = Some(Box::new(ContinuitySummaryClient {
+                    requests: requests.clone(),
+                }));
+                let mut state = create_test_state();
+                state.messages = compaction_reuse_history(CONTINUITY_FACT, 0);
+                // A first canonical admission can contain populated request
+                // history, without a previously persisted summary or head.
+                state.messages.remove(0);
+                state.messages[1]["content"] = json!(CONTINUITY_FACT);
+                let original = state.messages.clone();
+                let durable = if stale_proof {
+                    original[..2].to_vec()
+                } else {
+                    Vec::new()
+                };
+                state.initialize_provider_canonical_wal_base(&durable);
+                if stale_proof {
+                    let mut foreign = durable.clone();
+                    foreign[0]["content"] = json!("different admitted prefix");
+                    state.initialize_canonical_rewrite_proof(
+                        &foreign,
+                        &astra_turn_types::canonical_conversation_root(&foreign),
+                        0,
+                    );
+                    assert!(state.begin_canonical_rewrite().is_some());
+                } else {
+                    assert!(state.begin_canonical_rewrite().is_none());
+                    assert_eq!(
+                        state
+                            .provider_canonical_wal_base
+                            .as_ref()
+                            .unwrap()
+                            .canonical
+                            .message_count,
+                        0,
+                    );
+                }
+                let durable_base = state.provider_canonical_wal_base.clone().unwrap();
+                if prior_wal {
+                    // An earlier provider attempt has already admitted this
+                    // prefix during the first canonical turn. New history
+                    // follows it, before request preparation compacts again.
+                    let first = plan_provider_canonical_wal_transition(
+                        &durable_base,
+                        None,
+                        &original[..original.len() - 2],
+                        Vec::new(),
+                        None,
+                        ProviderCanonicalWalLimits::PRODUCTION,
+                    )
+                    .unwrap();
+                    state.provider_canonical_wal_head = Some(first.head);
+                }
+                let original_head = state.provider_canonical_wal_head.clone();
+                state.last_request_message_count = Some(original.len());
+                let config = compaction_reuse_config(true);
+                let result = host
+                    .compact_messages_via_memoria(
+                        &mut state,
+                        &original,
+                        &[],
+                        &[],
+                        CompactionTier::AggressivePrune,
+                        &config,
+                    )
+                    .await;
+
+                // This is the planner used by execute_turn before provider
+                // dispatch. Installing an unauthorized shorter history used
+                // to fail here with MissingLinkedPredecessor.
+                let next = plan_provider_canonical_wal_transition(
+                    &durable_base,
+                    state.provider_canonical_wal_head.as_ref(),
+                    &state.messages,
+                    Vec::new(),
+                    None,
+                    ProviderCanonicalWalLimits::PRODUCTION,
+                )
+                .expect("request-local fallback must preserve the linked provider predecessor");
+                assert!(next.transition.replacement_compaction_generation.is_none());
+                assert_eq!(state.messages, original);
+                assert_eq!(state.last_request_message_count, Some(original.len()));
+                assert_eq!(
+                    state
+                        .provider_canonical_wal_head
+                        .as_ref()
+                        .map(|head| &head.transition_id),
+                    original_head.as_ref().map(|head| &head.transition_id),
+                );
+                assert_eq!(
+                    state
+                        .provider_canonical_wal_head
+                        .as_ref()
+                        .map(|head| &head.result),
+                    original_head.as_ref().map(|head| &head.result),
+                );
+                assert_eq!(requests.lock().unwrap().len(), 1);
+                assert!(result.boundary.is_some());
+                assert!(result.messages.len() < original.len());
+                assert!(
+                    result
+                        .history_summary
+                        .as_deref()
+                        .unwrap()
+                        .contains(CONTINUITY_FACT)
+                );
+                assert!(
+                    crate::turn::cloud::compaction::prepare_request_summary(
+                        &original, &original, &result,
+                    )
+                    .is_some(),
+                    "the fixture must offer a useful candidate that lacks rewrite authority",
+                );
+                let mut terminal = state.messages.clone();
+                terminal.push(
+                    json!({"role":"assistant", "content":"completed with request-local context"}),
+                );
+                let (mode, _) = crate::turn::canonical_commit::canonical_commit_delta(
+                    &durable,
+                    stale_proof,
+                    &terminal,
+                    state.canonical_rewrite_proof(),
+                    false,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Append);
+                astra_turn_types::validate_canonical_tool_pairing(&terminal).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn request_compaction_failure_and_cancellation_do_not_install_history() {
+        for pending in [false, true] {
+            let mut host = test_host_builder("failure-owner", "failure-session")
+                .with_memoria_client(Some(Arc::new(CompactionMemoryFixture::default())))
+                .build();
+            let started = Arc::new(tokio::sync::Notify::new());
+            host.test_compaction_client = Some(Box::new(InterruptedCompactionSummary {
+                started: started.clone(),
+                pending,
+            }));
+            let mut state = create_test_state();
+            state.messages = compaction_reuse_history(CONTINUITY_FACT, 0);
+            let original = state.messages.clone();
+            state.initialize_canonical_rewrite_proof(
+                &original,
+                &astra_turn_types::canonical_conversation_root(&original),
+                0,
+            );
+            let mut config = summary_test_config("http://127.0.0.1:1/unused".into());
+            config.context_window = Some(32_000);
+            let mut call = Box::pin(host.compact_messages_via_memoria(
+                &mut state,
+                &original,
+                &[],
+                &[],
+                CompactionTier::AggressivePrune,
+                &config,
+            ));
+            if pending {
+                tokio::select! {
+                    _ = started.notified() => {},
+                    _ = &mut call => panic!("summary must remain in flight"),
+                }
+                drop(call);
+            } else {
+                let result = call.await;
+                assert!(
+                    result.boundary.is_some(),
+                    "mechanical fallback remains available"
+                );
+                assert!(result.history_summary.is_none());
+            }
+            assert_eq!(state.messages, original);
+            let mut terminal = state.messages.clone();
+            terminal
+                .push(json!({"role":"assistant", "content":"Completed after the failed summary"}));
+            let (mode, _) = crate::turn::canonical_commit::canonical_commit_delta(
+                &original,
+                true,
+                &terminal,
+                state.canonical_rewrite_proof(),
+                false,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Append);
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            host.test_compaction_client = Some(Box::new(ContinuitySummaryClient {
+                requests: requests.clone(),
+            }));
+            host.compact_messages_via_memoria(
+                &mut state,
+                &original,
+                &[],
+                &[],
+                CompactionTier::AggressivePrune,
+                &config,
+            )
+            .await;
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                1,
+                "failed/cancelled work cannot seed reuse"
+            );
+            assert_ne!(state.messages, original);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    async fn pre_turn_summary_continuity_survives_three_generations_and_resume() {
+        use crate::turn::agentic_loop::host::AgenticLoopHost;
+        use astra_turn_core::cache_placement::{CacheCapability, VolatilePlacement};
+        use astra_turn_core::cloud::history_summary::{
+            HISTORY_SUMMARY_FIELD, history_summary_text,
+        };
+
+        let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
+        for append_only in [false, true] {
+            let mut host = test_host_builder("summary-owner", "summary-session")
+                .with_admitted_model_execution(Some(test_gateway_execution(
+                    "http://127.0.0.1:1/unused",
+                    Some(1_000),
+                )))
+                .build();
+            let mut config = summary_test_config("http://127.0.0.1:1/unused".into());
+            config.model_name = "gpt-5-mini".into();
+            config.cache_capability = Some(CacheCapability {
+                volatile_placement: if append_only {
+                    VolatilePlacement::AppendOnlyUserTail
+                } else {
+                    VolatilePlacement::TailSuffix
+                },
+                ..CacheCapability::for_provider("openai")
+            });
+            host.remember_resolved_llm_config(&config);
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut state = create_test_state();
+            state.max_turn_input_tokens = 100_000;
+            state.messages = vec![
+                json!({"role":"system", "content":"HISTORY_STABLE_INSTRUCTION_MUST_NOT_BE_SUMMARIZED"}),
+                json!({"role":"user", "content":CONTINUITY_FACT}),
+                json!({"role":"assistant", "content":"Acknowledged"}),
+            ];
+
+            for generation in 0..3 {
+                state.compact_tier_applied = CompactionTier::Normal;
+                for round in 0..6 {
+                    let id = format!("summary-{generation}-{round}");
+                    state.messages.extend([
+                        json!({"role":"user", "content":format!("Continue {generation}/{round}: {}", "task context ".repeat(120))}),
+                        json!({"role":"assistant", "content":"Inspect evidence", "tool_calls":[{"id":id, "type":"function", "function":{"name":"read_file", "arguments":"{}"}}]}),
+                        json!({"role":"tool", "tool_call_id":id, "content":"observed evidence ".repeat(180)}),
+                        json!({"role":"assistant", "content":"Decision based on evidence"}),
+                    ]);
+                }
+                let active_control = format!("ACTIVE_RUNTIME_AUTHORITY_SENTINEL_{generation}");
+                let authority =
+                    crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                        &active_control,
+                        crate::turn::wire_assembly::RuntimeAuthorityKind::ActiveWorkAttemptStart,
+                        astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+                    )
+                    .unwrap()
+                    .unwrap();
+                state.messages.push(authority.clone());
+                let before = state.messages.clone();
+                state.initialize_canonical_rewrite_proof(
+                    &before,
+                    &astra_turn_types::canonical_conversation_root(&before),
+                    generation,
+                );
+                let spill = pre_turn_summary_spill_count(&before);
+                assert!(spill > 0);
+                let suffix = before[spill..].to_vec();
+                host.test_compaction_client = Some(Box::new(ContinuitySummaryClient {
+                    requests: requests.clone(),
+                }));
+                let event = host
+                    .maybe_pre_turn_compact(&mut state, 0.95)
+                    .await
+                    .unwrap_or_else(|| panic!(
+                        "pre-turn compaction not accepted: append_only={append_only}, generation={generation}, spill={spill}, summary_requests={}",
+                        requests.lock().unwrap().len(),
+                    ));
+                assert!(event.tokens_freed > 0);
+                assert_eq!(event.tokens_before - event.tokens_after, event.tokens_freed);
+                assert_eq!(&state.messages[1..], suffix.as_slice());
+                assert_eq!(state.messages.last(), Some(&authority));
+                assert!(
+                    history_summary_text(&state.messages[0])
+                        .unwrap()
+                        .contains(CONTINUITY_FACT)
+                );
+                astra_turn_types::validate_canonical_tool_pairing(&state.messages).unwrap();
+
+                let request = requests.lock().unwrap().last().unwrap().clone();
+                let serialized = serde_json::to_string(&request).unwrap();
+                assert!(
+                    serialized.contains(CONTINUITY_FACT),
+                    "generation {generation}"
+                );
+                assert!(!serialized.contains("HISTORY_STABLE_INSTRUCTION_MUST_NOT_BE_SUMMARIZED"));
+                assert!(!serialized.contains(&active_control));
+                if !append_only {
+                    assert!(!serialized.contains("ACTIVE_RUNTIME_AUTHORITY_SENTINEL"));
+                }
+                if generation > 0 {
+                    let evidence = request
+                        .iter()
+                        .find(|m| {
+                            m["content"]
+                                .as_str()
+                                .is_some_and(|s| s.contains(CONTINUITY_FACT))
+                        })
+                        .unwrap();
+                    assert_eq!(evidence["role"], "assistant");
+                }
+                astra_turn_types::validate_canonical_tool_pairing(&request).unwrap();
+
+                // Exercise the canonical replacement and continuation owners,
+                // not a JSON-only round trip. Resume the second generation
+                // from the exact unmarked envelope persisted by older builds.
+                let (mode, packs) = crate::turn::canonical_commit::canonical_commit_delta(
+                    &before,
+                    true,
+                    &state.messages,
+                    state.canonical_rewrite_proof(),
+                    false,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Replace);
+                let mut committed: Vec<Value> = packs.into_iter().flatten().collect();
+                assert_eq!(committed[0][HISTORY_SUMMARY_FIELD], 1);
+                if generation == 0 {
+                    committed[0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove(HISTORY_SUMMARY_FIELD);
+                }
+                let restored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(committed).unwrap();
+                assert!(
+                    history_summary_text(&restored[0])
+                        .unwrap()
+                        .contains(CONTINUITY_FACT)
+                );
+                assert_eq!(restored.last(), Some(&authority));
+                state = create_test_state();
+                state.max_turn_input_tokens = 100_000;
+                state.messages = restored;
+            }
+            assert_eq!(requests.lock().unwrap().len(), 3);
+        }
+    }
+
     #[test]
     fn pre_turn_summary_event_matches_the_applied_state_mutation() {
         let mut state = create_test_state();
@@ -37875,6 +38908,11 @@ mod tests {
     fn pre_turn_summary_rejects_a_summary_that_does_not_reduce_tokens() {
         let mut state = create_test_state();
         state.max_turn_input_tokens = 20_000;
+        state.messages.push(
+            astra_turn_core::cloud::history_summary::history_summary_message(
+                "ONLY_PRIOR_SUMMARY_FACT".into(),
+            ),
+        );
         for index in 0..12 {
             state.messages.push(json!({
                 "role": if index % 2 == 0 { "user" } else { "assistant" },
@@ -43131,7 +44169,6 @@ mod tests {
         let properties = bash["function"]["parameters"]["properties"]
             .as_object()
             .expect("Bash properties");
-        assert!(properties.contains_key("external_state_paths"));
         assert_eq!(
             bash, &ordinary_bash,
             "Bash's provider schema must not change when the external-effect obligation is admitted or settled"
@@ -46333,6 +47370,11 @@ mod tests {
             append_only
         ));
 
+        let mut thinking_config = summary_test_config(String::new());
+        thinking_config.thinking_capability =
+            Some(astra_services::models::ThinkingCapability::Both);
+        thinking_config.thinking_protocol =
+            Some(astra_core::model_wire::thinking::ThinkingProtocol::ThinkingObject);
         let adaptive = ThinkingConfig::Adaptive {
             effort: ThinkingEffort::High,
         };
@@ -46344,6 +47386,7 @@ mod tests {
                 true,
                 ProviderAttemptBoundary::new(false, false),
                 CacheProtocol::OpenAiAutoPrefix,
+                &thinking_config,
             ),
             adaptive,
             "text-only settlement must preserve the cached thinking shape"
@@ -46358,6 +47401,7 @@ mod tests {
                 true,
                 ProviderAttemptBoundary::new(false, false),
                 CacheProtocol::None,
+                &thinking_config,
             ),
             ThinkingConfig::Off,
             "uncached providers may suppress thinking on a text-only retry"
@@ -46370,6 +47414,7 @@ mod tests {
                 true,
                 ProviderAttemptBoundary::new(false, false),
                 CacheProtocol::OpenAiAutoPrefix,
+                &thinking_config,
             ),
             ThinkingConfig::Off,
             "canonical Work establishment remains an explicit convergence boundary"
@@ -46401,7 +47446,8 @@ mod tests {
                         work,
                         settlement,
                         ProviderAttemptBoundary::new(convergence, true),
-                        CacheProtocol::None
+                        CacheProtocol::None,
+                        &summary_test_config(String::new()),
                     ),
                     thinking
                 );
@@ -50808,11 +51854,11 @@ mod tests {
                 .build();
         let mut state = loop_state(session, Vec::new(), "Describe the supplied information.");
         host.prepare_model_selection(&mut state).await.unwrap();
-        state.provider_adaptation.force_next_thinking_off = true;
+        state.provider_adaptation.safe_recovery_pending = true;
         state.current_run_owner_generation = None;
         let error = host.execute_turn(&mut state).await.err().unwrap();
         assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
-        assert!(state.provider_adaptation.force_next_thinking_off);
+        assert!(state.provider_adaptation.safe_recovery_pending);
         assert!(gateway.requests.lock().await.is_empty());
         assert!(ledger.admissions().is_empty());
         ledger.assert_quiescent();
@@ -53778,4 +54824,5 @@ mod tests {
             );
         }
     }
+    include!("server_loop_host_recovery_tests.rs");
 }

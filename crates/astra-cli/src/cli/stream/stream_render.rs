@@ -1260,7 +1260,7 @@ struct CliSseStreamHost<'a> {
     last_permission_selection: Option<astra_turn_types::RunPermissionModeSelection>,
     api: &'a astra_thin_client::ThinClient,
     token: String,
-    auth_profile: Option<&'a str>,
+    owner_auth_snapshot: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     executor_id: &'a str,
     edge_agent_id: String,
     executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
@@ -1766,7 +1766,7 @@ impl<'a> CliSseStreamHost<'a> {
         ctx: EdgeSseContext<'a>,
         term_width: usize,
         render_md: bool,
-        auth_profile: Option<&'a str>,
+        owner_auth_snapshot: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     ) -> Self {
         let suppress_reasoning = ctx.render_policy == RenderPolicy::Silent;
         let active_turn_rollback = ctx.turn_rollback_on_failure.then(|| ActiveTurnRollback {
@@ -1784,7 +1784,7 @@ impl<'a> CliSseStreamHost<'a> {
             last_permission_selection: None,
             api: ctx.api,
             token: ctx.token.to_string(),
-            auth_profile,
+            owner_auth_snapshot,
             executor_id: ctx.executor_id,
             edge_agent_id: ctx.executor_id.to_string(),
             executor: ctx.executor,
@@ -1916,19 +1916,47 @@ impl<'a> CliSseStreamHost<'a> {
         }
     }
 
+    async fn resolve_edge_owner_bearer(&mut self) -> bool {
+        let Some(owner) = self.owner_auth_snapshot.as_ref() else {
+            return true; // A static bearer has no profile refresh authority.
+        };
+        if !owner.is_current() {
+            return false;
+        }
+        let api = self.api.clone().without_bearer_provider();
+        let Some(token) = session_runtime::owner_access_token(&api, owner, None).await else {
+            return false;
+        };
+        if !owner.is_current() {
+            return false;
+        }
+        self.token = token;
+        true
+    }
+
     async fn refresh_edge_token_after_401(&mut self) -> bool {
-        let Some(profile) = self.auth_profile else {
+        // Fail closed unless a captured owner was admitted at construction and is
+        // still the current login; never reselect current_profile or borrow another.
+        let Some(owner) = self.owner_auth_snapshot.as_ref() else {
             return false;
         };
         if !self.render_policy.is_silent() {
             eprintln!("{}", "  Token expired, attempting refresh…".yellow());
         }
-        if !session_runtime::attempt_token_refresh(self.api, Some(profile)).await {
+        if !owner.is_current() {
             return false;
         }
-        let Some(new_token) = session_runtime::current_access_token(Some(profile)) else {
+        // Detach any inherited bearer provider so it cannot override the
+        // explicitly admitted owner token.
+        let api = self.api.clone().without_bearer_provider();
+        let Some(new_token) =
+            session_runtime::owner_access_token(&api, owner, Some(self.token.as_str())).await
+        else {
             return false;
         };
+        if !owner.is_current() {
+            return false;
+        }
         self.token = new_token;
         if !self.render_policy.is_silent() {
             eprintln!(
@@ -1948,15 +1976,20 @@ impl<'a> CliSseStreamHost<'a> {
         &mut self,
         body: &astra_thin_client::ToolResultRequest,
     ) -> Result<(), PostToolResultError> {
-        let result = self
-            .api
+        if !self.resolve_edge_owner_bearer().await {
+            self.mark_edge_auth_failure(&body.run_id);
+            return Err(PostToolResultError::AuthRefreshFailed);
+        }
+        // Detach any inherited bearer provider so the explicitly admitted owner
+        // token is the only credential source for owned callback posts.
+        let api = self.api.clone().without_bearer_provider();
+        let result = api
             .post_tool_result(Some(self.token.as_str()), Some(self.executor_id), body)
             .await;
         match result {
             Ok(_) => Ok(()),
             Err(e) if is_edge_auth_failure(&e) && self.refresh_edge_token_after_401().await => {
-                let retry = self
-                    .api
+                let retry = api
                     .post_tool_result(Some(self.token.as_str()), Some(self.executor_id), body)
                     .await;
                 match retry {
@@ -1990,10 +2023,14 @@ impl<'a> CliSseStreamHost<'a> {
         &mut self,
         body: &astra_thin_client::ApprovalRespondRequest,
     ) -> Result<(), PostApprovalError> {
-        let result = self
-            .api
-            .post_approval(Some(self.token.as_str()), body)
-            .await;
+        if !self.resolve_edge_owner_bearer().await {
+            self.mark_edge_auth_failure(&body.run_id);
+            return Err(PostApprovalError::AuthRefreshFailed);
+        }
+        // Detach any inherited bearer provider so the explicitly admitted owner
+        // token is the only credential source for owned callback posts.
+        let api = self.api.clone().without_bearer_provider();
+        let result = api.post_approval(Some(self.token.as_str()), body).await;
         match result {
             Ok(_) => Ok(()),
             Err(e) if recorded_approval_decision(&e).is_some() => {
@@ -2002,10 +2039,7 @@ impl<'a> CliSseStreamHost<'a> {
                 ))
             }
             Err(e) if is_edge_auth_failure(&e) && self.refresh_edge_token_after_401().await => {
-                let retry = self
-                    .api
-                    .post_approval(Some(self.token.as_str()), body)
-                    .await;
+                let retry = api.post_approval(Some(self.token.as_str()), body).await;
                 if let Err(ref retry_err) = retry {
                     if let Some(decision) = recorded_approval_decision(retry_err) {
                         Err(PostApprovalError::AlreadyRecorded(decision))
@@ -4789,6 +4823,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             use crate::cli::chat_stream::StreamEvent;
             for effect in &effects {
                 let ev = match effect {
+                    SseRenderEffect::SystemWarning(message) => {
+                        Some(StreamEvent::SystemWarning(message.clone()))
+                    }
                     SseRenderEffect::StreamText {
                         model_item_id,
                         text: s,
@@ -4808,12 +4845,25 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     _ => None,
                 };
                 if let Some(ev) = ev {
-                    self.emit_stream_observation(ev).await;
+                    if matches!(ev, StreamEvent::SystemWarning(_)) {
+                        // Configuration diagnostics are rare control messages;
+                        // preserve each one when the interactive queue is full.
+                        self.emit_stream_event(ev).await;
+                    } else {
+                        self.emit_stream_observation(ev).await;
+                    }
                 }
             }
         }
 
         let policy = self.render_policy;
+        if !policy.is_silent() {
+            for effect in &effects {
+                if let SseRenderEffect::SystemWarning(message) = effect {
+                    eprintln!("{}", message.as_str().yellow());
+                }
+            }
+        }
         match policy {
             RenderPolicy::Silent => return,
             RenderPolicy::FinalOnly => {
@@ -4826,7 +4876,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         SseRenderEffect::ThinkingPreviewChunk { text: s, .. } => {
                             self.render.push_thinking_preview_chunk(s);
                         }
-                        SseRenderEffect::StreamText { .. } => {} // suppressed
+                        SseRenderEffect::StreamText { .. } | SseRenderEffect::SystemWarning(_) => {} // suppressed or already rendered
                     }
                 }
                 return;
@@ -4837,6 +4887,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         let mut i = 0usize;
         while i < effects.len() {
             match &effects[i] {
+                SseRenderEffect::SystemWarning(_) => {
+                    i += 1;
+                }
                 SseRenderEffect::StopThinkingSpinner => {
                     // `text_delta` emits Stop then StreamText; in plan-only mode we stream the
                     // assistant body into the reasoning viewport — skipping Stop avoids clearing
@@ -8445,6 +8498,7 @@ fn apply_sse_render_effects(
     }
     for effect in effects {
         match effect {
+            SseRenderEffect::SystemWarning(message) => eprintln!("{}", message.yellow()),
             SseRenderEffect::StreamText { text: s, .. } => {
                 if let Some(md) = &mut render.md {
                     md.push(&s);
@@ -8484,7 +8538,7 @@ pub(crate) async fn consume_turn_sse(
     explain_analyze_enabled: bool,
     edge: Option<EdgeSseContext<'_>>,
     pre_clear_lines: usize,
-    auth_profile: Option<&str>,
+    auth_owner: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     cancel_token: Option<&tokio_util::sync::CancellationToken>,
     stream_json_exchange: Option<crate::cli::stream::stream_json::StreamJsonExchange>,
 ) -> TurnResult {
@@ -8529,7 +8583,7 @@ pub(crate) async fn consume_turn_sse(
             ctx,
             term_width,
             render_md && !render_policy.suppress_text(),
-            auth_profile,
+            auth_owner,
         );
         host.explain_analyze_enabled = explain_analyze_enabled;
         host.stream_json_exchange = stream_json_exchange;
@@ -8869,6 +8923,76 @@ mod tests {
     use tempfile::tempdir;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn hook_config_diagnostics_reach_silent_tui_under_backpressure() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let root = tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".astra")).unwrap();
+        std::fs::write(
+            root.path().join(".astra/hooks.json"),
+            r#"{"hooks":[{"event":"pre_tool_use","matchr":"SECRET_MATCHER","action":{"type":"shell","command":"echo SECRET_COMMAND"}}]}"#,
+        )
+        .unwrap();
+        let (tools, _) = astra_runtime::skills::hooks::load_all_hooks(root.path());
+        let message = tools.take_config_diagnostics().pop().unwrap().to_string();
+        let event = astra_services::runs::transform_run_event_for_client(serde_json::json!({
+            "type": "warning", "code": "hook_configuration", "message": message,
+        }));
+        let mut accum = ChatTurnSseAccum::default();
+        let effects = astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+            &format!("data: {event}\n\n"),
+            &mut accum,
+            &mut Vec::new(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.send(chat_stream::StreamEvent::StatusLine("queued".into()))
+            .await
+            .unwrap();
+        let mut cache = EdgeToolCache::new(8);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "unused",
+                executor_id: "unused",
+                executor: std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(root.path())),
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: Some(tx),
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut cache,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+        let delivery = host.on_render_effects(effects);
+        tokio::pin!(delivery);
+        // A full channel retains this diagnostic instead of sampling it away.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut delivery)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            rx.recv().await,
+            Some(chat_stream::StreamEvent::StatusLine(_))
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), delivery)
+            .await
+            .unwrap();
+        let warning = rx.recv().await.unwrap();
+        assert!(matches!(warning,
+            chat_stream::StreamEvent::SystemWarning(text) if text == message && !text.contains("SECRET")));
+        assert!(accum.full_text.is_empty());
+        assert!(accum.error_message.is_none());
+    }
 
     #[test]
     fn unavailable_approval_explains_denial_without_exposing_credentials() {
@@ -10930,6 +11054,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn responsive_bash_uses_real_detach_slot_for_ctrl_b_handoff() {
         let dir = tempdir().expect("tempdir");
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
         let (slot, listener) = astra_tools::detach::new_slot_with_handle();
         let executor = std::sync::Arc::new(
             crate::edge_tools::ToolExecutor::new(dir.path()).with_bash_detach_slot(slot),
@@ -10943,6 +11069,7 @@ mod tests {
                 // compound shell command stays foreground so the edge
                 // executor can emit its post-workspace receipt.
                 "command": "sleep 5",
+                "workdir": "nested",
                 "timeout": 30.0,
             }),
             astra_tools::tool_engine::ToolInvocationMetadata::default(),
@@ -10966,6 +11093,31 @@ mod tests {
             .expect("edge bash should hand off promptly after Ctrl+B")
             .expect("payload");
         assert_eq!(payload.command, "sleep 5");
+        #[cfg(target_os = "linux")]
+        {
+            let pid = payload.child.id().expect("live detached child");
+            let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).expect("child cwd");
+            assert_eq!(cwd.canonicalize().unwrap(), nested.canonicalize().unwrap());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let pid = payload.child.id().expect("live detached child").to_string();
+            let probe = std::process::Command::new("/usr/sbin/lsof")
+                .args(["-a", "-p", &pid, "-d", "cwd", "-Fn"])
+                .output()
+                .expect("system lsof child-cwd probe");
+            assert!(probe.status.success(), "child cwd must remain observable");
+            let text = String::from_utf8(probe.stdout).unwrap();
+            let cwd = text
+                .lines()
+                .find_map(|line| line.strip_prefix('n'))
+                .expect("child cwd path");
+            assert_eq!(
+                std::path::Path::new(cwd).canonicalize().unwrap(),
+                nested.canonicalize().unwrap()
+            );
+        }
+
         payload
             .adoption_tx
             .send(Ok("bg-shell-edge".to_string()))
@@ -10976,6 +11128,10 @@ mod tests {
             .expect("detached edge bash should finish the tool call")
             .expect("join");
         assert!(!outcome.is_error, "{outcome:?}");
+        assert_eq!(
+            outcome.tool_result_fields.as_ref().unwrap()["bash_workdir"]["resolved_workspace_relative"],
+            "nested"
+        );
         assert!(
             outcome.output.contains("bash_detached"),
             "{}",
@@ -13740,8 +13896,42 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn edge_tool_result_401_refreshes_and_retries_without_terminal_auth_failure() {
-        let _creds_guard = crate::tests::isolate_credentials();
+        // 401 recovery is owned by the authenticated credential owner in both
+        // admission shapes: an explicit --profile and the raw omitted-profile
+        // value that still resolved the stored default profile at admission.
+        edge_tool_result_401_refresh_acknowledges_once(Some("test"), "unchanged", false).await;
+        edge_tool_result_401_refresh_acknowledges_once(None, "unchanged", false).await;
+        edge_tool_result_401_refresh_acknowledges_once(None, "unchanged", true).await;
+        for transition in [
+            "current_profile",
+            "replacement",
+            "account",
+            "logout",
+            "proactive_refresh_failure",
+        ] {
+            edge_tool_result_401_refresh_acknowledges_once(None, transition, false).await;
+            edge_tool_result_401_refresh_acknowledges_once(None, transition, true).await;
+        }
+    }
 
+    #[allow(clippy::await_holding_lock)]
+    async fn edge_tool_result_401_refresh_acknowledges_once(
+        auth_profile: Option<&str>,
+        transition: &str,
+        approval: bool,
+    ) {
+        let _creds_guard = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "test",
+            Some("user-id-1"),
+        )
+        .unwrap();
+
+        let initial_token = if transition == "proactive_refresh_failure" {
+            "eyJhbGciOiJub25lIn0.eyJleHAiOjF9.signature"
+        } else {
+            "expired-token"
+        };
         let mut creds = CredentialsFile {
             current_profile: Some("test".to_string()),
             ..Default::default()
@@ -13750,40 +13940,59 @@ mod tests {
             "test".to_string(),
             Profile {
                 account_id: Some("user-id-1".to_string()),
-                access_token: Some("expired-token".to_string()),
+                access_token: Some(initial_token.to_string()),
                 refresh_token: Some("refresh-token".to_string()),
                 ..Default::default()
             },
         );
         save_credentials(&creds).expect("save credentials");
 
+        let callback_path = if approval {
+            astra_thin_client::paths::APPROVAL_RESPOND
+        } else {
+            astra_thin_client::paths::TOOLS_RESULT
+        };
+        let should_post = matches!(transition, "unchanged" | "current_profile");
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path(astra_thin_client::paths::TOOLS_RESULT))
-            .and(header("authorization", "Bearer expired-token"))
+            .and(path(callback_path))
+            .and(header("authorization", format!("Bearer {initial_token}")))
             .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
                 "error": "expired"
             })))
-            .expect(1)
+            .expect(if should_post { 1 } else { 0 })
             .mount(&server)
             .await;
         Mock::given(method("POST"))
             .and(path(astra_thin_client::paths::AUTH_REFRESH))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "user_id": "user-id-1",
-                "access_token": "fresh-token",
-                "refresh_token": "fresh-refresh-token"
-            })))
-            .expect(1)
+            .respond_with(
+                ResponseTemplate::new(if transition == "proactive_refresh_failure" {
+                    401
+                } else {
+                    200
+                })
+                .set_body_json(serde_json::json!({
+                    "user_id": "user-id-1",
+                    "access_token": "fresh-token",
+                    "refresh_token": "fresh-refresh-token"
+                })),
+            )
+            .expect(
+                if should_post || transition == "proactive_refresh_failure" {
+                    1
+                } else {
+                    0
+                },
+            )
             .mount(&server)
             .await;
         Mock::given(method("POST"))
-            .and(path(astra_thin_client::paths::TOOLS_RESULT))
+            .and(path(callback_path))
             .and(header("authorization", "Bearer fresh-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "ok": true
             })))
-            .expect(1)
+            .expect(if should_post { 1 } else { 0 })
             .mount(&server)
             .await;
 
@@ -13791,14 +14000,16 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
         let mut tool_cache = EdgeToolCache::new(10);
+        let parent_cancel = tokio_util::sync::CancellationToken::new();
+        let physical_cancel = parent_cancel.child_token();
         let ctx = EdgeSseContext {
             api: &api,
-            token: "expired-token",
+            token: initial_token,
             executor_id: "edge-test",
             executor,
             render_policy: RenderPolicy::Silent,
             perm_manager: None,
-            cancel_token: None,
+            cancel_token: Some(&physical_cancel),
             stream_event_tx: None,
             stream_event_sink: None,
             approval_request_tx: None,
@@ -13809,7 +14020,28 @@ mod tests {
             incremental_state: None,
             request_session_execution_lease: None,
         };
-        let mut host = CliSseStreamHost::from_edge_ctx_with_auth(ctx, 80, false, Some("test"));
+        let auth_owner = crate::cli::session::session_runtime::capture_admitted_auth_owner(
+            &api,
+            auth_profile,
+            initial_token,
+        )
+        .await;
+        assert!(auth_owner.is_some());
+        match transition {
+            "current_profile" => creds.current_profile = Some("unrelated-profile".into()),
+            "replacement" => {
+                creds.profiles.get_mut("test").unwrap().access_token = Some("unknown-login".into())
+            }
+            "account" => {
+                creds.profiles.get_mut("test").unwrap().account_id = Some("other-account".into())
+            }
+            "logout" => {
+                creds.profiles.remove("test");
+            }
+            _ => (),
+        }
+        save_credentials(&creds).unwrap();
+        let mut host = CliSseStreamHost::from_edge_ctx_with_auth(ctx, 80, false, auth_owner);
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
             astra_thin_client::ToolResultRequestParts {
                 session_id: "test-session".to_string(),
@@ -13824,11 +14056,64 @@ mod tests {
             },
         );
 
-        let posted = host.post_tool_result_with_auth_retry(&body).await.is_ok();
+        let posted = if approval {
+            host.post_approval_with_auth_retry(&astra_thin_client::ApprovalRespondRequest {
+                request_id: "approval-1".into(),
+                decision: astra_thin_client::ApprovalDecision::Allow,
+                reason: None,
+                session_id: "test-session".into(),
+                run_id: "test-run".into(),
+                tool_name: Some("read_file".into()),
+                approval_kind: None,
+            })
+            .await
+            .is_ok()
+        } else {
+            host.post_tool_result_with_auth_retry(&body).await.is_ok()
+        };
 
-        assert!(posted);
+        assert_eq!(posted, should_post);
+        if !should_post {
+            assert!(host.auth_failure);
+            let mut held_open_peer = futures_util::stream::pending::<Result<Vec<u8>, String>>();
+            let (_, abort) = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                super::consume_sse_stream_cancellable(
+                    &mut held_open_peer,
+                    &mut host,
+                    std::time::Duration::from_secs(300),
+                    Some(&physical_cancel),
+                    None,
+                ),
+            )
+            .await
+            .expect("owner rejection must wake the physical reader before idle timeout");
+            assert!(abort.is_some());
+            assert!(physical_cancel.is_cancelled());
+            assert!(!parent_cancel.is_cancelled());
+            assert_eq!(host.callback_failure_run_id.as_deref(), Some("test-run"));
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                usize::from(transition == "proactive_refresh_failure")
+            );
+            return;
+        }
         assert!(!host.auth_failure);
+        assert!(!physical_cancel.is_cancelled());
+        assert!(!parent_cancel.is_cancelled());
         assert_eq!(host.token, "fresh-token");
+        let posts: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.url.path() == callback_path)
+            .collect();
+        assert_eq!(posts.len(), 2);
+        assert_eq!(
+            posts[0].body, posts[1].body,
+            "refresh only reposts the identical result and hash"
+        );
     }
 
     #[serial_test::serial]
@@ -13896,7 +14181,13 @@ mod tests {
             incremental_state: None,
             request_session_execution_lease: None,
         };
-        let mut host = CliSseStreamHost::from_edge_ctx_with_auth(ctx, 80, false, Some("test"));
+        let auth_owner = crate::cli::session::session_runtime::capture_admitted_auth_owner(
+            &api,
+            Some("test"),
+            "expired-token",
+        )
+        .await;
+        let mut host = CliSseStreamHost::from_edge_ctx_with_auth(ctx, 80, false, auth_owner);
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
             astra_thin_client::ToolResultRequestParts {
                 session_id: "test-session".to_string(),

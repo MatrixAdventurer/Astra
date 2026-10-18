@@ -241,7 +241,7 @@ pub(crate) struct CliServerAdmissionHost<'a> {
     pub runtime_config: Arc<astra_config::RuntimeConfig>,
     pub api: &'a astra_thin_client::ThinClient,
     pub token: String,
-    pub auth_profile: Option<&'a str>,
+    pub auth_owner: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     pub offering_id: Option<String>,
     pub model: Option<&'a str>,
     pub cli_context: Option<&'a crate::cli::cli_config::cli_context::CliContext>,
@@ -548,7 +548,8 @@ fn stream_event_requires_ordered_delivery(event: &crate::cli::chat_stream::Strea
     }
     matches!(
         event,
-        crate::cli::chat_stream::StreamEvent::SessionBound(_)
+        crate::cli::chat_stream::StreamEvent::SystemWarning(_)
+            | crate::cli::chat_stream::StreamEvent::SessionBound(_)
             | crate::cli::chat_stream::StreamEvent::AgentLiveGap(_)
             | crate::cli::chat_stream::StreamEvent::RunBound(_)
             | crate::cli::chat_stream::StreamEvent::ToolStarted { .. }
@@ -996,7 +997,7 @@ impl CliServerAdmissionHost<'_> {
                     tool_surface_config: &self.runtime_config.tool_surface,
                     api: self.api,
                     token: self.token.as_str(),
-                    auth_profile: self.auth_profile,
+                    auth_owner: self.auth_owner.clone(),
                     offering_id: effective_offering_id,
                     model: effective_model,
                     cli_context: self.cli_context,
@@ -1300,6 +1301,14 @@ impl CliServerAdmissionHost<'_> {
                 .or(unsettled_physical_owner_run_id);
         }
         Ok(turn_result)
+    }
+
+    pub(super) fn emit_system_warning(&mut self, message: String) {
+        if !self.render_policy.suppress_headless() {
+            eprintln!("{}", message.as_str().yellow());
+            self.pending_clear_lines += 1;
+        }
+        self.try_emit_stream_event(crate::cli::chat_stream::StreamEvent::SystemWarning(message));
     }
 
     fn emit_headless_line(&mut self, style: HeadlessStderrStyle, line: String) {
@@ -1970,6 +1979,23 @@ mod tests {
         assert!(stream_event_requires_ordered_delivery(
             &crate::cli::chat_stream::StreamEvent::SessionBound("session-live".into())
         ));
+    }
+
+    #[test]
+    fn hook_config_diagnostics_keep_each_local_warning_in_order() {
+        use crate::cli::chat_stream::StreamEvent;
+        let mut queue = std::collections::VecDeque::new();
+        for message in ["first diagnostic", "second diagnostic"] {
+            let event = StreamEvent::SystemWarning(message.into());
+            assert!(stream_event_requires_ordered_delivery(&event));
+            retain_ordered_stream_event_in_queue(&mut queue, event);
+        }
+        for message in ["first diagnostic", "second diagnostic"] {
+            assert!(
+                matches!(queue.pop_front(), Some(StreamEvent::SystemWarning(text)) if text == message)
+            );
+        }
+        assert!(queue.is_empty());
     }
 
     #[test]

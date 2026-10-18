@@ -26,6 +26,56 @@ The unused source-public `SkillLifecycleEvent` enum has been retired. Real
 skill invocation hooks and session-event dispatch remain the execution paths;
 constructing an event enum never provided telemetry delivery.
 
+### Event-hook configuration diagnostics
+
+The current project event-hook loader checks `.astra/hooks.json`, then
+`hooks.yaml`, then `hooks.yml`, at the already-authorized local workspace
+boundary. Missing files are optional. Read failures produce diagnostics and
+allow the next candidate; the first readable file wins, including an empty
+configuration. A syntax/schema error rejects that entire file's tool and
+session definitions and returns empty registries, without trying lower-priority
+files. This preserves the existing continuation/error policy; it does not make
+configuration errors a new admission block. Rejected unsafe shell definitions
+remain individually filtered while other valid definitions remain loaded.
+
+Both returned registries share redacted diagnostics, drained once per load via
+`take_config_diagnostics`. The shared loop and remote CLI publish them through
+the existing warning/message wire contract and visible TUI warning/Web toast
+channels, including when hook execution is disabled. Only explicitly marked hook
+configuration warnings pass the external Server projection; extra payload fields
+are discarded. Source names are project-relative; diagnostics include schema fields,
+array indices and parser line/column when available, never raw parser messages,
+config values, arbitrary map keys, commands, HTTP headers or environment values.
+A new load can report the same unresolved problem again. Diagnostics are not
+execution authority or persisted hook-continuation state.
+
+Standard runtime dispatch currently supports tool `pre_tool_use` /
+`post_tool_use` and session `session_start` / `session_end`. Accepted session
+values `user_prompt_submit`, `pre_compact`, `post_compact`, `file_changed`,
+`cwd_changed`, `turn_start` and `turn_end` now produce an unsupported-event
+warning. Definitions remain intact for existing programmatic consumers; no
+additional event dispatch is enabled. Unknown/invalid event names produce a
+field diagnostic and retain the whole-file parse-failure behavior.
+
+Unknown fields are rejected in the event-hook file wrapper (`hooks`,
+`session_hooks`, `default_timeout_secs`), each tool/session definition, and each
+`HookAction` variant. For example, `matchr` is a schema error; it no longer
+silently supplies the empty default matcher and activates on every tool. Like
+other schema errors, a typo rejects the entire first readable file, including
+otherwise valid definitions, and emits the existing redacted diagnostic without
+falling back. Diagnostics identify the nearest safe schema location and do not
+echo the unknown key. Correct or remove unrecognized fields when upgrading.
+Omitting `matcher` or explicitly using an empty string or `"*"` still intentionally
+matches all tools; existing timeout and execution defaults remain unchanged.
+
+`HookAction` is shared with skill lifecycle hooks, so unknown action fields also
+reject a skill manifest/frontmatter through its existing parser error path.
+Arbitrary keys and nested values inside `Custom.config`, and arbitrary HTTP
+`headers` keys, remain supported. This does not close unrelated skill frontmatter
+or the `SkillHooks` phase wrapper, change accepted event names or action support,
+introduce additional configuration scopes, or change admission,
+enforcement/circuit-breaker, or ServerSandbox/ServerLocal selection rules.
+
 ## Tools
 
 A tool is a callable schema. Tool visibility and execution are decided by the capability system.

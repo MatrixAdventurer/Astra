@@ -13765,12 +13765,14 @@ pub(crate) mod tests {
             Some(axum::http::StatusCode::NOT_IMPLEMENTED),
             None,
         ] {
-            assert_agent_binding_mcp_cancellation_settlement(notification_status).await;
+            assert_agent_binding_mcp_cancellation_settlement(notification_status, true).await;
+            assert_agent_binding_mcp_cancellation_settlement(notification_status, false).await;
         }
     }
 
     async fn assert_agent_binding_mcp_cancellation_settlement(
         notification_status: Option<axum::http::StatusCode>,
+        matching_response: bool,
     ) {
         let started = Arc::new(tokio::sync::Notify::new());
         let notified = Arc::new(tokio::sync::Notify::new());
@@ -13792,7 +13794,7 @@ pub(crate) mod tests {
                             started.notify_one();
                             settled.notified().await;
                             (axum::http::StatusCode::OK, axum::Json(json!({
-                                "jsonrpc": "2.0", "id": body["id"],
+                                "jsonrpc": "2.0", "id": if matching_response { body["id"].clone() } else { json!("old-exchange") },
                                 "result": {
                                     "content": [{"type": "text", "text": "cleanup settled"}],
                                     "_meta": {"astra.workspace_effect": {"settled": true}}
@@ -13844,6 +13846,7 @@ pub(crate) mod tests {
             () = tokio::time::sleep(Duration::from_secs(5)) => panic!("tool did not dispatch"),
         }
         token.cancel();
+        token.cancel();
         tokio::select! {
             result = &mut execution => panic!("notification must not settle tool: {:?}", result.result),
             () = notified.notified() => {}
@@ -13859,8 +13862,27 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .result;
-        assert!(!result.is_error, "{result:?}");
-        assert!(result.output.contains("cleanup settled"), "{result:?}");
+        let writer = astra_tools::workspace_observation::begin_workspace_writer_with_options(
+            _dir.path(),
+            None,
+            Duration::from_millis(50),
+        )
+        .await;
+        if matching_response {
+            assert!(!result.is_error, "{result:?}");
+            assert!(result.output.contains("cleanup settled"), "{result:?}");
+            assert!(writer.is_ok(), "matching completion admits the next writer");
+        } else {
+            assert!(result.is_error, "{result:?}");
+            assert_eq!(
+                result.metadata.as_ref().unwrap()["workspace_effect_settled"],
+                false
+            );
+            assert!(matches!(
+                writer,
+                Err(astra_tools::workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled)
+            ));
+        }
         server.abort();
     }
 
@@ -15239,7 +15261,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn bash_timeout_emits_tool_timeout_work_surface_metadata() {
-        let (mut exec, _dir) = test_executor();
+        let (mut exec, dir) = test_executor();
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         exec.set_work_surface_event_tx(tx);
 
@@ -15247,7 +15269,7 @@ for line in sys.stdin:
             .execute_with_metadata(
                 "bash",
                 &json!({
-                    "command": "printf start; sleep 1",
+                    "command": "printf partial > timeout-marker; printf start; sleep 1",
                     "timeout": 0.1,
                     "_tool_call_id": "call-tool-timeout"
                 }),
@@ -15257,7 +15279,14 @@ for line in sys.stdin:
         let metadata = result.metadata.as_ref().expect("tool timeout metadata");
         assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
         assert_eq!(metadata["reason"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
+        assert_eq!(metadata["execution_started"], true);
+        assert_eq!(metadata["disposition"], "executed");
+        assert_eq!(metadata["side_effects_maybe"], true);
         assert_eq!(metadata["workspace"]["kind"], "server_sandbox");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("timeout-marker")).unwrap(),
+            "partial"
+        );
 
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
