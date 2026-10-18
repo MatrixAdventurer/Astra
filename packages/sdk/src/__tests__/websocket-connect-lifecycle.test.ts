@@ -120,3 +120,59 @@ test('a constructor failure clears the pending attempt so a later connect can su
   await next;
   ws.close();
 });
+
+for (const callback of ['emitter', 'legacy'] as const) {
+  test(`${callback}: an error callback can start a replacement connection`, async () => {
+    let recovery: Promise<void> | undefined;
+    const recover = (state: string) => {
+      if (state === 'error') recovery = ws.connect();
+    };
+    const ws = new AstraWebSocket({
+      url: 'ws://localhost/ws', token: 'test-token', reconnect: false,
+      ...(callback === 'legacy' ? { onStateChange: recover } : {}),
+    });
+    if (callback === 'emitter') ws.on('stateChange', recover);
+    const first = ws.connect();
+    const rejected = expect(first).rejects.toThrow('WebSocket connection failed');
+    ControlledSocket.instances[0].onerror?.();
+    await rejected;
+    expect(ControlledSocket.instances).toHaveLength(2);
+    expect(recovery).toBeDefined();
+    ControlledSocket.instances[1].authenticate();
+    await recovery;
+    expect(ws.isConnected).toBe(true);
+    ws.close();
+  });
+
+  test(`${callback}: a denied reattach callback can use the authenticated connection`, async () => {
+    let recovering = false;
+    let recovery: Promise<void> | undefined;
+    const recover = (state: string) => {
+      if (recovering && state === 'connected') recovery = ws.connect();
+    };
+    const ws = new AstraWebSocket({
+      url: 'ws://localhost/ws', token: 'test-token', reconnect: false,
+      ...(callback === 'legacy' ? { onStateChange: recover } : {}),
+    });
+    if (callback === 'emitter') ws.on('stateChange', recover);
+    const first = ws.connect();
+    ControlledSocket.instances[0].authenticate();
+    await first;
+    ControlledSocket.instances[0].onmessage?.({ data: JSON.stringify({ type: 'run_started', run_id: 'missing-run' }) });
+    ws.close();
+    recovering = true;
+    const next = ws.connect();
+    const rejected = expect(next).rejects.toThrow('Not found');
+    const socket = ControlledSocket.instances[1];
+    socket.authenticate();
+    expect(JSON.parse(socket.sent[1])).toMatchObject({ type: 'attach_run', run_id: 'missing-run' });
+    socket.onmessage?.({ data: JSON.stringify({ type: 'error', message: 'Not found', retryable: false }) });
+    await rejected;
+    expect(recovery).toBeDefined();
+    await expect(recovery).resolves.toBeUndefined();
+    expect(ws.isConnected).toBe(true);
+    expect(ws.runId).toBeNull();
+    expect(ControlledSocket.instances).toHaveLength(2);
+    ws.close();
+  });
+}
