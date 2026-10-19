@@ -742,15 +742,45 @@ fn running_in_wsl() -> bool {
 
 #[cfg(target_os = "linux")]
 fn linux_login_browser_command(url: &str, wsl: bool) -> std::process::Command {
+    linux_login_browser_command_with_wslenv(url, wsl, std::env::var_os("WSLENV").as_deref())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_login_browser_command_with_wslenv(
+    url: &str,
+    wsl: bool,
+    wslenv: Option<&std::ffi::OsStr>,
+) -> std::process::Command {
     if wsl {
         // Reuse the safe Windows launcher: the OAuth URL is passed as data via
         // ASTRA_LOGIN_URL rather than interpolated into a shell command.
-        windows_browser_command(url)
+        let mut command = windows_browser_command(url);
+        command.env("WSLENV", forwarded_wslenv(wslenv));
+        command
     } else {
         let mut command = std::process::Command::new("xdg-open");
         command.arg(url);
         command
     }
+}
+
+#[cfg(target_os = "linux")]
+fn forwarded_wslenv(existing: Option<&std::ffi::OsStr>) -> std::ffi::OsString {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let mut entries = Vec::new();
+    if let Some(existing) = existing {
+        for entry in existing.as_bytes().split(|byte| *byte == b':') {
+            let name = entry.split(|byte| *byte == b'/').next().unwrap_or_default();
+            // WSLENV names are case-sensitive. Replace every exact entry so
+            // stale /u, /p or /l flags cannot suppress or transform the URL.
+            if !entry.is_empty() && name != b"ASTRA_LOGIN_URL" {
+                entries.push(entry);
+            }
+        }
+    }
+    entries.push(b"ASTRA_LOGIN_URL/w");
+    std::ffi::OsString::from_vec(entries.join(&b':'))
 }
 
 pub(crate) fn open_login_url(url: &str) {
@@ -1686,17 +1716,53 @@ mod tests {
         assert!(!super::is_wsl_kernel_release("6.8.0-generic"));
         let url =
             "https://uc.example.com/authorize?client_id=astra-cli&response_type=code&state=abc";
-        let linux = super::linux_login_browser_command(url, false);
+        let linux = super::linux_login_browser_command_with_wslenv(url, false, None);
         assert_eq!(linux.get_program(), std::ffi::OsStr::new("xdg-open"));
-        let wsl = super::linux_login_browser_command(url, true);
+        let wsl = super::linux_login_browser_command_with_wslenv(url, true, None);
         assert_eq!(wsl.get_program(), std::ffi::OsStr::new("powershell.exe"));
         assert!(wsl.get_envs().any(
             |(key, value)| key == "ASTRA_LOGIN_URL" && value == Some(std::ffi::OsStr::new(url))
         ));
+        assert!(wsl.get_envs().any(|(key, value)| {
+            key == "WSLENV" && value == Some(std::ffi::OsStr::new("ASTRA_LOGIN_URL/w"))
+        }));
         assert!(
             wsl.get_args()
                 .all(|arg| !arg.to_string_lossy().contains(url))
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wsl_login_normalizes_forwarded_environment() {
+        for (existing, expected) in [
+            (
+                "WT_SESSION:GTK_MODULES/w",
+                "WT_SESSION:GTK_MODULES/w:ASTRA_LOGIN_URL/w",
+            ),
+            (
+                "WT_SESSION:astra_login_url/p",
+                "WT_SESSION:astra_login_url/p:ASTRA_LOGIN_URL/w",
+            ),
+            ("ASTRA_LOGIN_URL", "ASTRA_LOGIN_URL/w"),
+            ("ASTRA_LOGIN_URL/u", "ASTRA_LOGIN_URL/w"),
+            ("ASTRA_LOGIN_URL/p", "ASTRA_LOGIN_URL/w"),
+            ("ASTRA_LOGIN_URL/l", "ASTRA_LOGIN_URL/w"),
+            (
+                "ASTRA_LOGIN_URL/u:FOO:ASTRA_LOGIN_URL/p",
+                "FOO:ASTRA_LOGIN_URL/w",
+            ),
+            ("FOO:ASTRA_LOGIN_URL/w", "FOO:ASTRA_LOGIN_URL/w"),
+        ] {
+            let command = super::linux_login_browser_command_with_wslenv(
+                "https://uc.example.com/authorize",
+                true,
+                Some(std::ffi::OsStr::new(existing)),
+            );
+            assert!(command.get_envs().any(|(key, value)| {
+                key == "WSLENV" && value == Some(std::ffi::OsStr::new(expected))
+            }));
+        }
     }
 
     #[test]
