@@ -284,6 +284,54 @@ fn round_calls(e: &JournalEvent) -> Option<&Vec<ToolCallRecord>> {
 
 type CallRunIndex<'a> = HashMap<(Option<u32>, &'a str), Option<(&'a str, bool)>>;
 
+type RoundCallIndex<'a> = HashMap<(Option<u32>, &'a str, &'a str), (usize, usize)>;
+
+fn inferred_error_scope<'a>(
+    event: &JournalEvent,
+    call_runs: &CallRunIndex<'a>,
+) -> Option<(&'a str, bool)> {
+    if event.event_type != JournalEventType::ToolCallError || run_id_of(event).is_some() {
+        return None;
+    }
+    let [call] = event.tool_calls.as_deref()? else {
+        return None;
+    };
+    call_runs
+        .get(&(event.turn, call.tool_call_id.as_deref()?))
+        .copied()
+        .flatten()
+}
+
+/// A matching round owns call order; an immediately persisted error is another
+/// observation of that call, even when terminal detail only covers other calls.
+fn normalized_error<'a>(
+    events: &'a [JournalEvent],
+    terminals: &TerminalIndex<'_>,
+    call_runs: &CallRunIndex<'a>,
+    round_positions: &RoundCallIndex<'a>,
+    event_idx: usize,
+) -> Option<((usize, usize), &'a ToolCallRecord)> {
+    let event = &events[event_idx];
+    if event.event_type != JournalEventType::ToolCallError {
+        return None;
+    }
+    let [call] = event.tool_calls.as_deref()? else {
+        return None;
+    };
+    let inferred = inferred_error_scope(event, call_runs);
+    let run = run_id_of(event).or(inferred.map(|(run, _)| run))?;
+    let &(round, offset) =
+        round_positions.get(&(event.turn, run, call.tool_call_id.as_deref()?))?;
+    let representative = &events[round].tool_calls.as_ref()?[offset];
+    if call.name != representative.name
+        || call.was_executed() != representative.was_executed()
+        || terminals.owner(events, event_idx, inferred) != terminals.owner(events, round, None)
+    {
+        return None;
+    }
+    Some(((round, offset), representative))
+}
+
 fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
     // Terminals own authoritative counts and prefer their own detail over round
     // projections. Resolve observations across the complete snapshot, including
@@ -304,22 +352,34 @@ fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
     // Production ToolCallError records lack a run ID. Resolve only an
     // unambiguous (turn, call ID) witness; never merge different known runs.
     let mut call_runs: CallRunIndex<'_> = HashMap::new();
-    for e in events {
-        if let Some(run) = run_id_of(e) {
-            for call in e.tool_calls.iter().flatten() {
-                if let Some(id) = call.tool_call_id.as_deref() {
-                    call_runs
-                        .entry((e.turn, id))
-                        .and_modify(|known| {
-                            if let Some((known_run, child)) = known {
-                                if *known_run == run {
-                                    *child |= is_child_round(e);
-                                } else {
-                                    *known = None;
+    let mut round_positions: RoundCallIndex<'_> = HashMap::new();
+    // These lookups serve error admission and normalization only.
+    if events
+        .iter()
+        .any(|event| event.event_type == JournalEventType::ToolCallError)
+    {
+        for (idx, e) in events.iter().enumerate() {
+            if let Some(run) = run_id_of(e) {
+                for (offset, call) in e.tool_calls.iter().flatten().enumerate() {
+                    if let Some(id) = call.tool_call_id.as_deref() {
+                        if e.event_type == JournalEventType::LlmRound {
+                            round_positions
+                                .entry((e.turn, run, id))
+                                .or_insert((idx, offset));
+                        }
+                        call_runs
+                            .entry((e.turn, id))
+                            .and_modify(|known| {
+                                if let Some((known_run, child)) = known {
+                                    if *known_run == run {
+                                        *child |= is_child_round(e);
+                                    } else {
+                                        *known = None;
+                                    }
                                 }
-                            }
-                        })
-                        .or_insert(Some((run, is_child_round(e))));
+                            })
+                            .or_insert(Some((run, is_child_round(e))));
+                    }
                 }
             }
         }
@@ -328,14 +388,7 @@ fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
         if let Some(calls) = round_calls(e) {
             let anonymous_error =
                 e.event_type == JournalEventType::ToolCallError && run_id_of(e).is_none();
-            let inferred_scope = anonymous_error
-                .then(|| {
-                    (calls.len() == 1)
-                        .then(|| calls[0].tool_call_id.as_deref())
-                        .flatten()
-                        .and_then(|id| call_runs.get(&(e.turn, id)).copied().flatten())
-                })
-                .flatten();
+            let inferred_scope = inferred_error_scope(e, &call_runs);
             let unresolved_error = anonymous_error && inferred_scope.is_none();
             let owner = (!unresolved_error)
                 .then(|| index.owner(events, idx, inferred_scope))
@@ -343,11 +396,16 @@ fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
             match owner {
                 Some(t) => owned.entry(t).or_default().push(idx),
                 None => {
+                    let normalized =
+                        normalized_error(events, &index, &call_runs, &round_positions, idx);
                     for (offset, call) in calls.iter().enumerate() {
+                        let ((position, within), call) =
+                            normalized.unwrap_or(((idx, offset), call));
                         if call.tool_call_id.as_deref().is_some_and(|id| {
                             !orphan_ids.insert((
                                 e.turn,
                                 run_id_of(e).or(inferred_scope.map(|(run, _)| run)),
+                                unresolved_error,
                                 id,
                             ))
                         }) {
@@ -357,7 +415,7 @@ fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
                             out.complete = false;
                         }
                         out.executed = out.executed.saturating_add(u64::from(call.was_executed()));
-                        slots.insert((idx, offset, 0), call);
+                        slots.insert((position, within, 0), call);
                     }
                 }
             }
@@ -371,9 +429,11 @@ fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
         let mut locations = HashMap::new();
         let mut round_locations = HashMap::new();
         for &r in &rounds {
+            let normalized = normalized_error(events, &index, &call_runs, &round_positions, r);
             for (offset, call) in round_calls(&events[r]).into_iter().flatten().enumerate() {
+                let (position, call) = normalized.unwrap_or(((r, offset), call));
                 if let Some(id) = call.tool_call_id.as_deref() {
-                    locations.entry(id).or_insert((r, offset));
+                    locations.entry(id).or_insert(position);
                 }
                 if events[r].event_type == JournalEventType::LlmRound {
                     if let Some(round) = call.round {
@@ -429,7 +489,9 @@ fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
             if terminal_detail && events[r].event_type != JournalEventType::ToolCallError {
                 continue;
             }
+            let normalized = normalized_error(events, &index, &call_runs, &round_positions, r);
             for (offset, call) in round_calls(&events[r]).into_iter().flatten().enumerate() {
+                let ((position, within), call) = normalized.unwrap_or(((r, offset), call));
                 if call
                     .tool_call_id
                     .as_deref()
@@ -437,7 +499,7 @@ fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
                 {
                     continue;
                 }
-                slots.insert((r, offset, 0), call);
+                slots.insert((position, within, 0), call);
                 detailed += u64::from(call.was_executed());
             }
         }
@@ -1119,6 +1181,111 @@ mod tests {
     }
 
     #[test]
+    fn round_order_is_invariant_under_redundant_error_observation() {
+        use astra_services::session_journal::{
+            JournalDirGuard, JournalWriter, LlmRoundRecord, TurnEventBuffer,
+        };
+
+        fn write_session(terminal_detail: Option<usize>, error: Option<(bool, bool)>) -> String {
+            let sid = uuid::Uuid::new_v4().to_string();
+            let read: super::ToolCallRecord = serde_json::from_value(json!({
+                "tool_call_id":"read","name":"read_file","round":0,
+                "start_offset_ms":0,"ok":true,"ms":1
+            }))
+            .unwrap();
+            let failed: super::ToolCallRecord = serde_json::from_value(json!({
+                "tool_call_id":"failed","name":"bash","round":0,
+                "start_offset_ms":10,"ok":false,"ms":1,"error":"exit 1"
+            }))
+            .unwrap();
+            let mut buffer = TurnEventBuffer::begin_turn(Some(&sid), 1);
+            let mut record = LlmRoundRecord::new(astra_turn_types::InferencePurpose::PrimaryAgent);
+            record.run_id = Some("root".into());
+            record.tool_calls = Some(vec![read.clone(), failed.clone()]);
+            record.tool_calls_returned = 2;
+            buffer.record_llm_round(record);
+            let mut events = buffer.drain();
+            events[0].ts = "2026-10-19T00:00:01Z".into();
+            if let Some((before_round, explicit_run)) = error {
+                let mut event =
+                    JournalEvent::tool_call_error(Some(&sid), 1, "bash", "exit 1", failed.clone());
+                if explicit_run {
+                    event = event.with_run_id(Some("root"));
+                }
+                event.ts = if before_round {
+                    "2026-10-19T00:00:00Z"
+                } else {
+                    "2026-10-19T00:00:02Z"
+                }
+                .into();
+                events.push(event);
+            }
+            if let Some(with_detail) = terminal_detail {
+                let mut event = JournalEvent::turn(
+                    Some(&sid),
+                    1,
+                    Some("test-model"),
+                    "run",
+                    "done",
+                    2,
+                    0,
+                    0,
+                    0,
+                )
+                .with_run_id(Some("root"));
+                event.ts = "2026-10-19T00:00:03Z".into();
+                if with_detail > 0 {
+                    let mut calls = vec![read, failed];
+                    calls.truncate(with_detail);
+                    event = event.with_tool_calls(calls);
+                }
+                // Partial terminal data keeps its independent executed aggregate.
+                event.tool_count = Some(2);
+                events.push(event);
+            }
+            let writer = JournalWriter::new(&sid).unwrap();
+            for event in events {
+                writer.append(&event).unwrap();
+            }
+            sid
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(dir.path());
+        for terminal in [None, Some(0), Some(1), Some(2)] {
+            // Partial terminal detail needs the standalone error to supplement
+            // the missing failure. Compare it to the complete-detail control.
+            let control = write_session(
+                if terminal == Some(1) {
+                    Some(2)
+                } else {
+                    terminal
+                },
+                None,
+            );
+            for before_round in [true, false] {
+                for explicit_run in [false, true] {
+                    let sid = write_session(terminal, Some((before_round, explicit_run)));
+                    let diff = super::compute_diff(&sid, &control).unwrap();
+                    assert_eq!(
+                        diff.a_tool_sequence,
+                        ["read_file", "bash"],
+                        "terminal={terminal:?}, before={before_round}, explicit={explicit_run}"
+                    );
+                    assert_eq!(diff.a_tool_sequence, diff.b_tool_sequence);
+                    assert_eq!(diff.a_tool_calls_executed, 2);
+                    assert!(diff.a_tool_sequence_complete);
+                    let json = serde_json::to_value(&diff).unwrap();
+                    assert_eq!(json["a_tool_sequence"], json!(["read_file", "bash"]));
+                    assert_eq!(json["a_tool_calls_executed"], 2);
+                    assert_eq!(json["a_tool_sequence_complete"], true);
+                    assert!(!render_text(&diff).contains("tool sequence DIFFERS"));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn review_followup_production_error_without_run_id_is_not_counted_twice() {
         let record: super::ToolCallRecord = serde_json::from_value(json!({
             "tool_call_id":"failed-bash","name":"bash","round":0,
@@ -1140,12 +1307,54 @@ mod tests {
             vec![error.clone(), round.clone()],
             vec![round.clone(), error.clone()],
             vec![error.clone(), round.clone(), terminal.clone()],
+            vec![error.clone(), round.clone(), error.clone(), round.clone()],
+            vec![
+                error.clone(),
+                round.clone(),
+                error.clone(),
+                round.clone(),
+                terminal.clone(),
+            ],
             vec![terminal, round.clone(), error],
         ] {
             let diff = diff_events("a", "b", &events, &[]);
             assert_eq!(diff.a_tool_sequence, ["bash"]);
             assert_eq!(diff.a_tool_calls_executed, 1);
             assert!(diff.a_tool_sequence_complete);
+        }
+        // Missing IDs and multi-call errors cannot inherit a round's identity.
+        let failed = round.tool_calls.as_ref().unwrap()[0].clone();
+        let mut missing_id = failed.clone();
+        missing_id.tool_call_id = None;
+        let missing = JournalEvent::tool_call_error(Some("a"), 1, "bash", "exit 1", missing_id);
+        let mut multiple =
+            JournalEvent::tool_call_error(Some("a"), 1, "bash", "exit 1", failed.clone());
+        let mut another = failed;
+        another.tool_call_id = Some("another-failure".into());
+        multiple.tool_calls.as_mut().unwrap().push(another);
+        for (error, retained) in [(missing, 2), (multiple, 3)] {
+            let diff = diff_events("a", "b", &[round.clone(), error], &[]);
+            assert_eq!(diff.a_tool_calls_executed, retained);
+            assert!(!diff.a_tool_sequence_complete);
+        }
+        // Missing run identity on both projections is not a positive witness.
+        // Keep uncertain error evidence separate from a runless round.
+        let mut runless = round.clone();
+        runless.producer_scope = None;
+        let error = JournalEvent::tool_call_error(
+            Some("a"),
+            1,
+            "bash",
+            "exit 1",
+            runless.tool_calls.as_ref().unwrap()[0].clone(),
+        );
+        for events in [
+            vec![runless.clone(), error.clone(), error.clone()],
+            vec![error, runless],
+        ] {
+            let diff = diff_events("a", "b", &events, &[]);
+            assert_eq!(diff.a_tool_calls_executed, 2);
+            assert!(!diff.a_tool_sequence_complete);
         }
         // A reused provider ID in a distinct known run is not a duplicate.
         let mut other = round.clone();
