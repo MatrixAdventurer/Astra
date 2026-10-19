@@ -60,11 +60,8 @@ use std::time::Duration;
 pub(super) async fn launch_login_url(url: String) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     if running_in_wsl() {
-        let primary = wsl_browser_command(&url, std::env::var_os("WSLENV").as_deref());
-        let mut fallback = Command::new("wslview");
-        fallback.arg(&url);
-        return launch_wsl_commands(
-            [("powershell.exe", primary), ("wslview", fallback)],
+        return run_wsl_launcher(
+            wsl_browser_command(&url, std::env::var_os("WSLENV").as_deref()),
             Duration::from_secs(5),
             Duration::from_secs(1),
         )
@@ -100,34 +97,33 @@ fn hand_off_browser(command: Command) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-struct LauncherFailure {
-    description: String,
-    cleanup_settled: bool,
-}
+struct LauncherGroup(Option<u32>);
 
 #[cfg(target_os = "linux")]
-async fn launch_wsl_commands(
-    commands: [(&'static str, Command); 2],
-    attempt_timeout: Duration,
-    cleanup_timeout: Duration,
-) -> Result<(), String> {
-    let mut failures = Vec::with_capacity(2);
-    for (label, command) in commands {
-        match run_wsl_launcher(command, label, attempt_timeout, cleanup_timeout).await {
-            Ok(()) => return Ok(()),
-            Err(failure) => {
-                failures.push(failure.description);
-                if !failure.cleanup_settled {
-                    break;
-                }
-            }
-        }
+impl LauncherGroup {
+    fn signal(&mut self) {
+        astra_tools::detach::sigkill_process_group_id(self.0.take());
     }
-    Err(failures.join("; "))
+
+    fn release(&mut self) {
+        self.0 = None;
+    }
 }
 
 #[cfg(target_os = "linux")]
-async fn stop_launcher(child: &mut tokio::process::Child, timeout: Duration) -> bool {
+impl Drop for LauncherGroup {
+    fn drop(&mut self) {
+        self.signal();
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn stop_launcher(
+    child: &mut tokio::process::Child,
+    group: &mut LauncherGroup,
+    timeout: Duration,
+) -> bool {
+    group.signal();
     let _ = child.start_kill();
     matches!(tokio::time::timeout(timeout, child.wait()).await, Ok(Ok(_)))
 }
@@ -135,73 +131,68 @@ async fn stop_launcher(child: &mut tokio::process::Child, timeout: Duration) -> 
 #[cfg(target_os = "linux")]
 async fn run_wsl_launcher(
     command: Command,
-    label: &'static str,
     attempt_timeout: Duration,
     cleanup_timeout: Duration,
-) -> Result<(), LauncherFailure> {
-    let mut child = tokio::process::Command::from(command)
+) -> Result<(), String> {
+    let child = tokio::process::Command::from(command)
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|error| LauncherFailure {
-            description: format!("{label} could not start ({:?})", error.kind()),
-            cleanup_settled: true,
-        })?;
+        .map_err(|error| format!("powershell.exe could not start ({:?})", error.kind()))?;
+    // wait() clears Child::id(), but a failed wrapper can leave group members.
+    // Tuple order also signals the group before dropping the child if the
+    // owner is destroyed without being polled, including runtime shutdown.
+    let resources = (LauncherGroup(child.id()), child);
     let (mut sender, receiver) = tokio::sync::oneshot::channel();
     // This task owns only process collection. Dropping the login's receiver
-    // requests cleanup; it cannot launch a fallback, publish progress or log in.
+    // requests local cleanup; it cannot publish progress or log in. POSIX group
+    // signaling cannot revoke a Windows browser request already in flight.
     let owner = tokio::spawn(async move {
+        let mut resources = resources;
+        let (group, child) = &mut resources;
         let outcome = tokio::select! {
             biased;
             _ = sender.closed() => {
-                let _ = stop_launcher(&mut child, cleanup_timeout).await;
+                let _ = stop_launcher(child, group, cleanup_timeout).await;
                 return;
             }
             outcome = tokio::time::timeout(attempt_timeout, child.wait()) => outcome,
         };
         let reason = match outcome {
+            Ok(Ok(status)) if status.success() => {
+                // Successful handoff may leave a browser alive. Do not kill it.
+                group.release();
+                let _ = sender.send(Ok(()));
+                return;
+            }
             Ok(Ok(status)) => {
                 use std::os::unix::process::ExitStatusExt;
-                let result = if status.success() {
-                    Ok(())
-                } else {
-                    Err(LauncherFailure {
-                        description: format!(
-                            "{label} exited unsuccessfully (code {:?}, signal {:?})",
-                            status.code(),
-                            status.signal()
-                        ),
-                        cleanup_settled: true,
-                    })
-                };
-                let _ = sender.send(result);
-                return;
+                format!(
+                    "exited unsuccessfully (code {:?}, signal {:?})",
+                    status.code(),
+                    status.signal()
+                )
             }
             Ok(Err(error)) => format!("wait failed ({:?})", error.kind()),
             Err(_) => "timed out".to_string(),
         };
-        let cleanup_settled = stop_launcher(&mut child, cleanup_timeout).await;
-        let _ = sender.send(Err(LauncherFailure {
-            description: format!(
-                "{label} {reason}{}",
-                if cleanup_settled {
-                    ""
-                } else {
-                    "; cleanup is unverified"
-                }
-            ),
-            cleanup_settled,
-        }));
+        let collected = stop_launcher(child, group, cleanup_timeout).await;
+        let _ = sender.send(Err(format!(
+            "powershell.exe {reason}{}",
+            if collected {
+                ""
+            } else {
+                "; local launcher collection is unverified"
+            }
+        )));
     });
     let result = receiver.await;
     match (result, owner.await) {
         (Ok(result), Ok(())) => result,
-        _ => Err(LauncherFailure {
-            description: format!("{label} process owner failed; cleanup is unverified"),
-            cleanup_settled: false,
-        }),
+        _ => Err("powershell.exe process owner failed; local cleanup is unverified".into()),
     }
 }
 
@@ -285,7 +276,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     mod processes {
-        use super::super::{hand_off_browser, launch_wsl_commands, wsl_browser_command};
+        use super::super::{hand_off_browser, run_wsl_launcher, wsl_browser_command};
         use nix::{
             errno::Errno,
             sys::{
@@ -304,13 +295,19 @@ mod tests {
             command
         }
 
+        fn read_pid(path: &Path) -> Option<Pid> {
+            std::fs::read_to_string(path)
+                .ok()?
+                .parse::<i32>()
+                .ok()
+                .map(Pid::from_raw)
+        }
+
         async fn pid_file(path: &Path) -> Pid {
             tokio::time::timeout(Duration::from_secs(3), async {
                 loop {
-                    if let Ok(pid) = std::fs::read_to_string(path)
-                        && let Ok(pid) = pid.parse::<i32>()
-                    {
-                        return Pid::from_raw(pid);
+                    if let Some(pid) = read_pid(path) {
+                        return pid;
                     }
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
@@ -332,112 +329,272 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn launcher_completion_controls_fallback_and_sanitizes_failure() {
+        async fn launcher_observes_completion_and_sanitizes_failure() {
             let dir = tempfile::tempdir().unwrap();
-            let fallback = dir.path().join("fallback");
-            for script in ["exit 0", "exit 7", "kill -TERM $$"] {
-                let _ = std::fs::remove_file(&fallback);
-                launch_wsl_commands(
-                    [
-                        ("powershell.exe", shell(script, &[])),
-                        ("wslview", shell("printf fallback > \"$1\"", &[&fallback])),
-                    ],
-                    Duration::from_secs(1),
-                    Duration::from_secs(1),
-                )
-                .await
-                .unwrap();
-                assert_eq!(fallback.exists(), script != "exit 0");
-            }
-            let missing = Command::new(dir.path().join("missing"));
-            launch_wsl_commands(
-                [
-                    ("powershell.exe", missing),
-                    ("wslview", shell("exit 0", &[])),
-                ],
+            run_wsl_launcher(
+                shell("exit 0", &[]),
                 Duration::from_secs(1),
                 Duration::from_secs(1),
             )
             .await
             .unwrap();
-
-            let secret = "synthetic-URL-state-that-must-not-appear";
-            let mut primary = shell("printf '%s' \"$SECRET\" >&2; exit 7", &[]);
-            primary.env("SECRET", secret);
-            let error = launch_wsl_commands(
-                [
-                    ("powershell.exe", primary),
-                    ("wslview", shell("exit 9", &[])),
-                ],
+            for (script, expected) in [
+                ("exit 7", "code Some(7)"),
+                ("kill -TERM $$", "signal Some(15)"),
+            ] {
+                let error = run_wsl_launcher(
+                    shell(script, &[]),
+                    Duration::from_secs(1),
+                    Duration::from_secs(1),
+                )
+                .await
+                .unwrap_err();
+                assert!(error.contains(expected), "{error}");
+            }
+            let error = run_wsl_launcher(
+                Command::new(dir.path().join("missing")),
                 Duration::from_secs(1),
                 Duration::from_secs(1),
             )
             .await
             .unwrap_err();
-            assert!(error.contains("powershell.exe") && error.contains("wslview"));
-            assert!(error.contains("Some(7)") && error.contains("Some(9)"));
+            assert!(error.contains("could not start (NotFound)"));
+
+            let secret = "synthetic-URL-state-that-must-not-appear";
+            let mut command = shell("printf '%s' \"$SECRET\" >&2; exit 7", &[]);
+            command.env("SECRET", secret);
+            let error = run_wsl_launcher(command, Duration::from_secs(1), Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert!(error.contains("powershell.exe") && error.contains("Some(7)"));
             assert!(!error.contains(secret));
         }
 
         #[tokio::test]
-        async fn launcher_timeout_reaps_before_fallback_and_bounds_both_attempts() {
-            let dir = tempfile::tempdir().unwrap();
-            let primary_pid = dir.path().join("primary");
-            let fallback_pid = dir.path().join("fallback");
-            let result = launch_wsl_commands(
-                [
-                    (
-                        "powershell.exe",
-                        shell(
-                            "printf '%s' \"$$\" > \"$1\"; exec /bin/sleep 30",
-                            &[&primary_pid],
-                        ),
-                    ),
-                    (
-                        "wslview",
-                        shell(
-                            "if kill -0 \"$(cat \"$1\")\" 2>/dev/null; then exit 44; fi; printf '%s' \"$$\" > \"$2\"; exec /bin/sleep 30",
-                            &[&primary_pid, &fallback_pid],
-                        ),
-                    ),
-                ],
-                Duration::from_millis(200),
-                Duration::from_secs(1),
-            );
-            let error = tokio::time::timeout(Duration::from_secs(4), result)
+        async fn wsl_dispatch_does_not_invoke_an_alternate_launcher() {
+            if let Ok(expected) = std::env::var("ASTRA_WSL_LAUNCH_EXPECTED") {
+                let error = super::super::launch_login_url(
+                    "https://login.example/authorize?state=synthetic".into(),
+                )
                 .await
-                .unwrap()
                 .unwrap_err();
-            assert_eq!(error.matches("timed out").count(), 2, "{error}");
-            collected(pid_file(&primary_pid).await).await;
-            collected(pid_file(&fallback_pid).await).await;
+                assert!(error.contains(&expected), "{error}");
+                return;
+            }
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let fallback = dir.path().join("wslview");
+            let marker = dir.path().join("fallback-invoked");
+            std::fs::write(
+                &fallback,
+                "#!/bin/sh\nprintf invoked > \"$FALLBACK_MARKER\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let primary = dir.path().join("powershell.exe");
+            for (script, expected) in [
+                (None, "could not start (NotFound)"),
+                (Some("exit 7"), "code Some(7)"),
+                (Some("exec /bin/sleep 30"), "timed out"),
+            ] {
+                if let Some(script) = script {
+                    std::fs::write(&primary, format!("#!/bin/sh\n{script}\n")).unwrap();
+                    std::fs::set_permissions(&primary, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                }
+                let test = concat!(
+                    module_path!(),
+                    "::wsl_dispatch_does_not_invoke_an_alternate_launcher"
+                )
+                .split_once("::")
+                .unwrap()
+                .1;
+                let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .args(["--exact", test, "--nocapture"])
+                    .env("ASTRA_WSL_LAUNCH_EXPECTED", expected)
+                    .env("WSL_DISTRO_NAME", "Astra-test")
+                    .env("PATH", dir.path())
+                    .env("FALLBACK_MARKER", &marker)
+                    .kill_on_drop(true);
+                let output = tokio::time::timeout(Duration::from_secs(12), child.output())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+                assert!(!marker.exists(), "{expected}");
+            }
+        }
+
+        struct GroupGuard(Pid);
+
+        impl Drop for GroupGuard {
+            fn drop(&mut self) {
+                let _ = nix::sys::signal::killpg(self.0, Signal::SIGKILL);
+            }
+        }
+
+        async fn collect_group(group: Pid) {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    match waitpid(Pid::from_raw(-group.as_raw()), Some(WaitPidFlag::WNOHANG)) {
+                        Err(Errno::ECHILD) => break,
+                        Ok(nix::sys::wait::WaitStatus::StillAlive) => {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        Ok(_) => {}
+                        Err(error) => panic!("collect launcher group: {error}"),
+                    }
+                }
+            })
+            .await
+            .expect("launcher descendants must settle");
+        }
+
+        fn delegated_command(dir: &Path, mode: &str) -> Command {
+            let mut command = shell(
+                r#"
+                    printf '%s' "$$" > "$PARENT"
+                    /bin/sh -c 'printf "%s" "$$" > "$CHILD"; while [ ! -e "$GATE" ]; do /bin/sleep 0.01; done; printf launched > "$EFFECT"' &
+                    case "$MODE" in
+                        exit|success)
+                            while [ ! -s "$CHILD" ]; do /bin/sleep 0.01; done
+                            [ "$MODE" = success ] && exit 0
+                            exit 7 ;;
+                        *) wait ;;
+                    esac
+                "#,
+                &[],
+            );
+            command
+                .env("PARENT", dir.join("parent"))
+                .env("CHILD", dir.join("child"))
+                .env("GATE", dir.join("gate"))
+                .env("EFFECT", dir.join("effect"))
+                .env("MODE", mode);
+            command
+        }
+
+        async fn delegated_launcher_case(mode: &str) {
+            // Adopt this fixture's orphaned children so the test proves their
+            // termination and reaps them without depending on the host's init.
+            nix::sys::prctl::set_child_subreaper(true).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let parent_path = dir.path().join("parent");
+            let child_path = dir.path().join("child");
+            let gate = dir.path().join("gate");
+            let effect = dir.path().join("effect");
+            let command = delegated_command(dir.path(), mode);
+            let task = tokio::spawn(run_wsl_launcher(
+                command,
+                Duration::from_secs(if mode == "timeout" { 1 } else { 5 }),
+                Duration::from_secs(1),
+            ));
+            let parent = pid_file(&parent_path).await;
+            let _guard = GroupGuard(parent);
+            let child = pid_file(&child_path).await;
+            if mode == "cancel" {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            } else {
+                let result = tokio::time::timeout(Duration::from_secs(3), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                match mode {
+                    "success" => result.unwrap(),
+                    "exit" => assert!(result.unwrap_err().contains("code Some(7)")),
+                    "timeout" => assert!(result.unwrap_err().contains("timed out")),
+                    _ => unreachable!(),
+                }
+            }
+            collected(parent).await;
+            if mode == "success" {
+                assert!(kill(child, None).is_ok(), "successful handoff must survive");
+            }
+            // Releasing the effect only after the parent has been collected
+            // catches cleanup that kills a wrapper but leaves its work alive.
+            std::fs::write(&gate, "continue").unwrap();
+            collect_group(parent).await;
+            assert_eq!(effect.exists(), mode == "success", "{mode}");
+            assert_eq!(kill(child, None), Err(Errno::ESRCH));
+        }
+
+        #[test]
+        fn runtime_shutdown_signals_polled_and_unpolled_launcher_groups() {
+            use std::future::{Future, poll_fn};
+            use std::task::Poll;
+            use std::time::Instant;
+
+            nix::sys::prctl::set_child_subreaper(true).unwrap();
+            for polled in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let mut launch = Box::pin(run_wsl_launcher(
+                    delegated_command(dir.path(), "wait"),
+                    Duration::from_secs(30),
+                    Duration::from_secs(1),
+                ));
+                // Spawn the owner without yielding to it: its captured resource
+                // tuple must clean up even if the async body never runs.
+                runtime.block_on(poll_fn(|context| {
+                    assert!(launch.as_mut().poll(context).is_pending());
+                    Poll::Ready(())
+                }));
+                if polled {
+                    runtime.block_on(async {
+                        assert!(
+                            tokio::time::timeout(Duration::from_millis(20), launch.as_mut())
+                                .await
+                                .is_err()
+                        );
+                    });
+                }
+                // Readiness is synchronous so the queued owner stays unpolled.
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let (parent, child) = loop {
+                    if let Some(parent) = read_pid(&dir.path().join("parent"))
+                        && let Some(child) = read_pid(&dir.path().join("child"))
+                    {
+                        break (parent, child);
+                    }
+                    assert!(Instant::now() < deadline, "launcher readiness");
+                    std::thread::sleep(Duration::from_millis(5));
+                };
+                let _guard = GroupGuard(parent);
+                drop(runtime);
+                drop(launch);
+                std::fs::write(dir.path().join("gate"), "continue").unwrap();
+                // The destroyed runtime cannot await reaping; the independent
+                // fixture collector settles every process before asserting.
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(collect_group(parent));
+                assert!(!dir.path().join("effect").exists(), "owner polled={polled}");
+                assert_eq!(kill(child, None), Err(Errno::ESRCH));
+            }
         }
 
         #[tokio::test]
-        async fn cancelling_the_caller_reaps_without_starting_fallback() {
-            let dir = tempfile::tempdir().unwrap();
-            let pid_path = dir.path().join("pid");
-            let fallback = dir.path().join("fallback");
-            let commands = [
-                (
-                    "powershell.exe",
-                    shell(
-                        "printf '%s' \"$$\" > \"$1\"; exec /bin/sleep 30",
-                        &[&pid_path],
-                    ),
-                ),
-                ("wslview", shell("printf unexpected > \"$1\"", &[&fallback])),
-            ];
-            let task = tokio::spawn(launch_wsl_commands(
-                commands,
-                Duration::from_secs(5),
-                Duration::from_secs(1),
-            ));
-            let pid = pid_file(&pid_path).await;
-            task.abort();
-            assert!(task.await.unwrap_err().is_cancelled());
-            collected(pid).await;
-            assert!(!fallback.exists());
+        async fn failed_or_cancelled_launcher_stops_delegated_local_work() {
+            for mode in ["timeout", "cancel", "exit"] {
+                delegated_launcher_case(mode).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn successful_wsl_handoff_preserves_the_browser() {
+            delegated_launcher_case("success").await;
         }
 
         #[tokio::test]
@@ -479,16 +636,9 @@ mod tests {
                         Some(std::ffi::OsStr::new("KEEP/p:ASTRA_LOGIN_URL/u")),
                     );
                     primary.env("PATH", &path).env("OUT_FILE", &output);
-                    launch_wsl_commands(
-                        [
-                            ("powershell.exe", primary),
-                            ("wslview", shell("exit 99", &[])),
-                        ],
-                        Duration::from_secs(2),
-                        Duration::from_secs(1),
-                    )
-                    .await
-                    .unwrap();
+                    run_wsl_launcher(primary, Duration::from_secs(2), Duration::from_secs(1))
+                        .await
+                        .unwrap();
                     assert_eq!(
                         std::fs::read_to_string(output).unwrap(),
                         format!("{url}\nKEEP/p:ASTRA_LOGIN_URL/w")
