@@ -146,10 +146,10 @@ export class AstraWebSocket {
   private emit<K extends keyof AstraWSEventMap>(
     type: K,
     data: AstraWSEventMap[K],
-    isCurrent: () => boolean,
+    isCurrent?: () => boolean,
   ): void {
     this.listeners.get(type)?.forEach((fn) => {
-      if (!isCurrent()) return;
+      if (isCurrent && !isCurrent()) return;
       try {
         fn(data);
       } catch {
@@ -294,7 +294,7 @@ export class AstraWebSocket {
           this.reconnectAttempts = 0;
           this.setConnectionState("connected", pending.resolve);
         }
-        if (accepted && this.ws === socket) this.notifyEvent(data as StreamEvent);
+        if (accepted) this.notifyEvent(data as StreamEvent);
         return;
       }
       if (pending && data.type === "error") {
@@ -310,6 +310,7 @@ export class AstraWebSocket {
           this.deferredTerminalReplayIndex = null;
           this.seenDeferredFrames.clear();
         }
+        const accepted = this.applyEvent(data as StreamEvent);
         pending.reject(new Error(data.message ?? "Run attachment failed"));
         if (retryable) {
           // An authenticated socket with a failed retryable attachment is not reusable.
@@ -318,7 +319,7 @@ export class AstraWebSocket {
           this.reconnectAttempts = 0;
           this.setConnectionState("connected");
         }
-        if (this.ws === socket) this.processEvent(data as StreamEvent);
+        if (accepted) this.notifyEvent(data as StreamEvent);
         if (retryable) socket.close();
         return;
       }
@@ -536,15 +537,14 @@ export class AstraWebSocket {
   }
 
   private notifyEvent(event: StreamEvent): void {
-    const socket = this.ws;
-    const isCurrent = () => this.ws === socket;
+    // Acceptance is already recorded: closing in a callback cannot revoke this frame.
     try {
       this.opts.onEvent?.(event);
     } catch {
       // Match emitter exception isolation for option callbacks.
     }
-    this.emit("event", event, isCurrent);
-    this.emit(event.type as keyof AstraWSEventMap, event, isCurrent);
+    this.emit("event", event);
+    this.emit(event.type as keyof AstraWSEventMap, event);
   }
 
   private clearReconnectTimer(): void {

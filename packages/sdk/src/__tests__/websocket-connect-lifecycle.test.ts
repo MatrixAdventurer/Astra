@@ -208,10 +208,13 @@ test('a reattach acknowledgement listener can replace the connection without sta
     replacement = ws.connect();
   };
   ws.on('session_info', replace);
+  const acknowledgements: unknown[] = [];
+  ws.on('session_info', (event) => acknowledgements.push(event));
   attaching.onmessage?.({ data: JSON.stringify({ type: 'session_info', session_id: 'session', run_id: 'owned-run' }) });
   const replaced = replacement!.catch((error) => error);
   try {
     expect(ws.connectionState).toBe('connecting');
+    expect(acknowledgements).toHaveLength(1);
     await accepted;
     const current = ControlledSocket.instances[2];
     current.authenticate();
@@ -222,49 +225,41 @@ test('a reattach acknowledgement listener can replace the connection without sta
 });
 
 test('throwing state callbacks cannot interrupt connection settlement or cleanup', async () => {
+  const states: string[] = [];
   const ws = new AstraWebSocket({
     url: 'ws://localhost/ws', token: 'test-token', reconnect: false,
-    onStateChange: (state) => {
-      if (state !== 'connecting') throw new Error('consumer callback failed');
-    },
+    onStateChange: () => { throw new Error('consumer callback failed'); },
   });
-  let outcome = 'pending';
-  const connecting = Promise.resolve().then(() => ws.connect()).then(
-    () => { outcome = 'resolved'; }, () => { outcome = 'rejected'; },
-  );
+  ws.on('stateChange', (state) => states.push(state));
   try {
-    await Promise.resolve();
+    const connecting = ws.connect();
     expect(ControlledSocket.instances).toHaveLength(1);
     ControlledSocket.instances[0].authenticate();
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(outcome).toBe('resolved');
     await connecting;
     expect(ws.isConnected).toBe(true);
-    expect(() => ws.close()).not.toThrow();
+    ws.close();
+    expect(states).toEqual(['connecting', 'connected', 'disconnected']);
     expect(ws.readyState).toBe(ControlledSocket.CLOSED);
-  } finally { try { ws.close(); } catch {} await connecting; }
+  } finally { ws.close(); }
 });
 
-test('throwing event callbacks cannot orphan an accepted attachment', async () => {
+test('throwing event callbacks cannot orphan an accepted attachment or suppress later consumers', async () => {
   const ws = new AstraWebSocket({
     url: 'ws://localhost/ws', token: 'test-token', reconnect: false,
     onEvent: () => { throw new Error('consumer callback failed'); },
   });
-  const connecting = ws.connect();
-  const socket = ControlledSocket.instances[0];
-  socket.authenticate();
-  await connecting;
-  let outcome = 'pending';
-  const attached = ws.attachRun('owned-run').then(
-    () => { outcome = 'resolved'; }, () => { outcome = 'rejected'; },
-  );
+  const received: unknown[] = [];
+  ws.on('session_info', (event) => received.push(event));
   try {
-    socket.onmessage?.({ data: JSON.stringify({ type: 'session_info', session_id: 'session', run_id: 'owned-run' }) });
-    await Promise.resolve();
-    expect(outcome).toBe('resolved');
+    const connecting = ws.connect();
+    const socket = ControlledSocket.instances[0];
+    socket.authenticate();
+    await connecting;
+    const attached = ws.attachRun('owned-run');
+    const acknowledgement = { type: 'session_info', session_id: 'session', run_id: 'owned-run' };
+    socket.onmessage?.({ data: JSON.stringify(acknowledgement) });
     await attached;
+    expect(received).toEqual([acknowledgement]);
     expect(ws.runId).toBe('owned-run');
     expect(ws.isConnected).toBe(true);
   } finally { ws.close(); }
@@ -335,9 +330,146 @@ for (const stage of ['authentication', 'reattachment', 'attachment'] as const) {
         socket = ControlledSocket.instances.at(-1)!;
         socket.authenticate();
       }
-      socket.onmessage?.({ data: JSON.stringify({ type: 'session_info', session_id: 'session', run_id: 'owned-run' }) });
+      if (stage !== 'authentication') {
+        expect(JSON.parse(socket.sent.at(-1)!)).toMatchObject({ type: 'attach_run', run_id: 'owned-run' });
+        socket.onmessage?.({ data: JSON.stringify({ type: 'session_info', session_id: 'session', run_id: 'owned-run' }) });
+      }
       await attempt;
       expect(ws.isConnected).toBe(true);
     } finally { ws.close(); }
   });
 }
+
+for (const cleanupApi of ['option', 'generic', 'typed'] as const) {
+  test(`${cleanupApi}: terminal cleanup does not interrupt the accepted frame's other subscribers`, async () => {
+    const terminal = { type: 'run_finished', run_id: 'owned-run', index: 1, owner_generation: 1, status: 'completed' };
+    let ws: AstraWebSocket;
+    const cleanup = (event: { type: string }) => { if (event.type === 'run_finished') ws.close(); };
+    ws = new AstraWebSocket({
+      url: 'ws://localhost/ws', token: 'test-token', reconnect: false,
+      ...(cleanupApi === 'option' ? { onEvent: cleanup } : {}),
+    });
+    if (cleanupApi === 'generic') ws.on('event', cleanup);
+    if (cleanupApi === 'typed') ws.on('run_finished', cleanup);
+    const generic: unknown[] = [];
+    const typed: unknown[] = [];
+    ws.on('event', (event) => { if (event.type === 'run_finished') generic.push(event); });
+    ws.on('run_finished', () => { throw new Error('subscriber failed'); });
+    ws.on('run_finished', (event) => typed.push(event));
+    try {
+      const connected = ws.connect();
+      const socket = ControlledSocket.instances[0];
+      socket.authenticate();
+      await connected;
+      socket.onmessage?.({ data: JSON.stringify({ type: 'run_started', run_id: 'owned-run' }) });
+      socket.onmessage?.({ data: JSON.stringify(terminal) });
+      expect(generic).toEqual([terminal]);
+      expect(typed).toEqual([terminal]);
+      expect(ws.connectionState).toBe('disconnected');
+      expect(ws.runId).toBeNull();
+    } finally { ws.close(); }
+  });
+}
+
+test('accepted frame reaches every consumer once even when a subscriber reconnects before inclusive replay', async () => {
+  const ws = client();
+  const received: string[] = [];
+  let replacement: Promise<void | Error> | undefined;
+  ws.on('event', (event) => {
+    if (event.type === 'text_delta' && !replacement) {
+      ws.close();
+      replacement = ws.connect().catch((error: Error) => error);
+    }
+  });
+  ws.on('text_delta', (event) => { if (event.type === 'text_delta') received.push(event.content); });
+  try {
+    const connected = ws.connect();
+    const old = ControlledSocket.instances[0];
+    old.authenticate();
+    await connected;
+    old.onmessage?.({ data: JSON.stringify({ type: 'run_started', run_id: 'owned-run' }) });
+    const frame = { type: 'text_delta', run_id: 'owned-run', index: 3, content: 'hello' };
+    old.onmessage?.({ data: JSON.stringify(frame) });
+    expect(received).toEqual(['hello']);
+    expect(ws.connectionState).toBe('connecting');
+    old.onmessage?.({ data: JSON.stringify({ ...frame, index: 4, content: 'stale' }) });
+    expect(received).toEqual(['hello']);
+    const current = ControlledSocket.instances[1];
+    current.authenticate();
+    expect(JSON.parse(current.sent[1])).toEqual({ type: 'attach_run', run_id: 'owned-run', last_index: 3 });
+    current.onmessage?.({ data: JSON.stringify({ type: 'session_info', session_id: 'session', run_id: 'owned-run' }) });
+    expect(await replacement).toBeUndefined();
+    current.onmessage?.({ data: JSON.stringify(frame) });
+    current.onmessage?.({ data: JSON.stringify({ ...frame, index: 4, content: 'next' }) });
+    expect(received).toEqual(['hello', 'next']);
+    expect(ws.isConnected).toBe(true);
+  } finally { ws.close(); await replacement; }
+});
+
+test('state notifications still stop when their callback closes the committed connection', async () => {
+  const states: string[] = [];
+  const ws = new AstraWebSocket({
+    url: 'ws://localhost/ws', token: 'test-token', reconnect: false,
+    onStateChange: (state) => { if (state === 'connected') ws.close(); },
+  });
+  ws.on('stateChange', (state) => states.push(state));
+  try {
+    const connected = ws.connect();
+    ControlledSocket.instances[0].authenticate();
+    await connected;
+    expect(states).toEqual(['connecting', 'disconnected']);
+    expect(ws.isConnected).toBe(false);
+  } finally { ws.close(); }
+});
+
+test.each([
+  { reply: { type: 'session_info', session_id: 'session', run_id: 'owned-run' }, error: undefined, runId: 'owned-run' },
+  { reply: { type: 'error', message: 'Not found', retryable: false }, error: 'Not found', runId: null },
+])('reattach $reply.type reaches event subscribers even when its connected notification closes the transport', async ({ reply, error, runId }) => {
+  let closeOnConnected = false;
+  const ws = new AstraWebSocket({
+    url: 'ws://localhost/ws', token: 'test-token', reconnect: false,
+    onStateChange: (state) => { if (closeOnConnected && state === 'connected') ws.close(); },
+  });
+  const replies: unknown[] = [];
+  ws.on('session_info', (event) => replies.push(event));
+  ws.on('error', (event) => replies.push(event));
+  try {
+    const initial = ws.connect();
+    const first = ControlledSocket.instances[0];
+    first.authenticate();
+    await initial;
+    first.onmessage?.({ data: JSON.stringify({ type: 'run_started', run_id: 'owned-run' }) });
+    first.close();
+    await Promise.resolve();
+    const reconnect = ws.connect().then(() => undefined, (failure: Error) => failure.message);
+    const socket = ControlledSocket.instances[1];
+    socket.authenticate();
+    closeOnConnected = true;
+    socket.onmessage?.({ data: JSON.stringify(reply) });
+    expect(await reconnect).toBe(error);
+    expect(replies).toEqual([reply]);
+    expect(ws.isConnected).toBe(false);
+    expect(ws.runId).toBe(runId);
+  } finally { ws.close(); }
+});
+
+test('accepted-frame delivery preserves listener removal and addition during dispatch', async () => {
+  const ws = client();
+  const received: string[] = [];
+  const removed = () => { received.push('removed'); };
+  const added = () => { received.push('added'); };
+  ws.on('text_delta', () => {
+    ws.off('text_delta', removed);
+    ws.on('text_delta', added);
+  });
+  ws.on('text_delta', removed);
+  try {
+    const connecting = ws.connect();
+    const socket = ControlledSocket.instances[0];
+    socket.authenticate();
+    await connecting;
+    socket.onmessage?.({ data: JSON.stringify({ type: 'text_delta', content: 'hello' }) });
+    expect(received).toEqual(['added']);
+  } finally { ws.close(); }
+});
