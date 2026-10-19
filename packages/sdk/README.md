@@ -151,6 +151,12 @@ ws.on('text_delta', (event) => console.log(event.content));
 ws.sendMessage('Build a REST API', { sessionId: 'sess-1' });
 ```
 
+Concurrent calls to `connect()` share one connection attempt. It resolves after
+authentication and any active run's reattachment, before success callbacks run.
+`close()` rejects unfinished attempts, stops automatic reconnection, and closes
+the local transport without cancelling the server run. State and event callbacks
+may reconnect synchronously; callback exceptions are isolated from the transport.
+
 ### Browser apps and the BFF pattern
 
 Do not expose long-lived **refresh tokens** in browser-accessible JavaScript.
