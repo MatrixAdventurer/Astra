@@ -8,6 +8,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod browser_code;
+mod browser_launcher;
 #[cfg(test)]
 mod login_discovery_tests;
 pub(crate) mod uc;
@@ -61,6 +62,7 @@ fn reject_native_login_downgrade(profile: Option<&str>) -> Result<(), String> {
 
 pub(crate) enum LoginProgress {
     OpenBrowser(String),
+    BrowserLaunchFailed(String),
     Completing,
 }
 
@@ -69,9 +71,10 @@ pub(crate) type LoginObserver =
 
 pub(crate) fn terminal_login_observer() -> LoginObserver {
     std::sync::Arc::new(|progress| {
-        if let LoginProgress::OpenBrowser(url) = progress {
-            eprintln!("Open this page to sign in:\n{url}");
-            open_login_url(&url);
+        match progress {
+            LoginProgress::OpenBrowser(url) => eprintln!("Open this page to sign in:\n{url}"),
+            LoginProgress::BrowserLaunchFailed(reason) => eprintln!("{reason}"),
+            LoginProgress::Completing => {}
         }
         Ok(())
     })
@@ -84,16 +87,59 @@ pub(crate) async fn browser_login(
     observer: LoginObserver,
     terminal_workspace_prompt: bool,
 ) -> Result<(), String> {
+    browser_login_with_launcher(
+        api,
+        profile,
+        method,
+        observer,
+        terminal_workspace_prompt,
+        browser_launcher::launch_login_url,
+    )
+    .await
+}
+
+pub(crate) async fn browser_login_with_launcher(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    method: LoginMethod,
+    observer: LoginObserver,
+    terminal_workspace_prompt: bool,
+    launch: impl AsyncFnOnce(String) -> Result<(), String>,
+) -> Result<(), String> {
     match method {
         LoginMethod::Uc(discovery) => {
-            uc::login_with_observer(api, discovery, observer, terminal_workspace_prompt).await
+            uc::login_with_observer(api, discovery, observer, terminal_workspace_prompt, launch)
+                .await
         }
         LoginMethod::Memoria(website) => {
-            do_memoria_browser_login_observed(api, profile, &website, observer).await?;
+            do_memoria_browser_login_impl(
+                api,
+                profile,
+                &website,
+                async |url| present_login_url(url, &observer, launch).await,
+                || observer(LoginProgress::Completing),
+            )
+            .await?;
             Ok(())
         }
         LoginMethod::Password => Err("Password authentication requires the account form".into()),
     }
+}
+
+async fn present_login_url(
+    url: String,
+    observer: &LoginObserver,
+    launch: impl AsyncFnOnce(String) -> Result<(), String>,
+) -> Result<(), String> {
+    observer(LoginProgress::OpenBrowser(url.clone()))?;
+    if let Err(reason) = launch(url).await {
+        // Opening is advisory. The displayed manual URL and callback remain
+        // valid even if automatic opening or warning delivery fails.
+        let _ = observer(LoginProgress::BrowserLaunchFailed(format!(
+            "Could not open a browser automatically: {reason}. Use the sign-in link shown above."
+        )));
+    }
+    Ok(())
 }
 
 /// Session authentication failure that can be repaired by `/login`.
@@ -301,27 +347,11 @@ async fn do_memoria_browser_login_with_opener(
         api,
         profile,
         website_base,
-        |url| {
-            open(url);
+        async |url| {
+            open(&url);
             Ok(())
         },
         || Ok(()),
-    )
-    .await
-}
-
-async fn do_memoria_browser_login_observed(
-    api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
-    website_base: &str,
-    observer: LoginObserver,
-) -> Result<String, String> {
-    do_memoria_browser_login_impl(
-        api,
-        profile,
-        website_base,
-        |url| observer(LoginProgress::OpenBrowser(url.to_owned())),
-        || observer(LoginProgress::Completing),
     )
     .await
 }
@@ -330,7 +360,7 @@ async fn do_memoria_browser_login_impl(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     website_base: &str,
-    open: impl FnOnce(&str) -> Result<(), String>,
+    open: impl AsyncFnOnce(String) -> Result<(), String>,
     completing: impl Fn() -> Result<(), String>,
 ) -> Result<String, String> {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -355,9 +385,8 @@ async fn do_memoria_browser_login_impl(
         env!("CARGO_PKG_VERSION")
     );
     let connect_url = browser_code::append_capability(&connect_url, &verifier)?;
-    open(&connect_url)?;
-
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    open(connect_url).await?;
     let mut rejected = 0_u8;
     let mut requests = 0_u8;
     loop {
@@ -727,97 +756,6 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
-#[cfg(target_os = "linux")]
-fn is_wsl_kernel_release(release: &str) -> bool {
-    release.to_ascii_lowercase().contains("microsoft")
-}
-
-#[cfg(target_os = "linux")]
-fn running_in_wsl() -> bool {
-    std::env::var_os("WSL_DISTRO_NAME").is_some()
-        || std::env::var_os("WSL_INTEROP").is_some()
-        || std::fs::read_to_string("/proc/sys/kernel/osrelease")
-            .is_ok_and(|release| is_wsl_kernel_release(&release))
-}
-
-#[cfg(target_os = "linux")]
-fn linux_login_browser_command(url: &str, wsl: bool) -> std::process::Command {
-    linux_login_browser_command_with_wslenv(url, wsl, std::env::var_os("WSLENV").as_deref())
-}
-
-#[cfg(target_os = "linux")]
-fn linux_login_browser_command_with_wslenv(
-    url: &str,
-    wsl: bool,
-    wslenv: Option<&std::ffi::OsStr>,
-) -> std::process::Command {
-    if wsl {
-        // Reuse the safe Windows launcher: the OAuth URL is passed as data via
-        // ASTRA_LOGIN_URL rather than interpolated into a shell command.
-        let mut command = windows_browser_command(url);
-        command.env("WSLENV", forwarded_wslenv(wslenv));
-        command
-    } else {
-        let mut command = std::process::Command::new("xdg-open");
-        command.arg(url);
-        command
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn forwarded_wslenv(existing: Option<&std::ffi::OsStr>) -> std::ffi::OsString {
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
-
-    let mut entries = Vec::new();
-    if let Some(existing) = existing {
-        for entry in existing.as_bytes().split(|byte| *byte == b':') {
-            let name = entry.split(|byte| *byte == b'/').next().unwrap_or_default();
-            // WSLENV names are case-sensitive. Replace every exact entry so
-            // stale /u, /p or /l flags cannot suppress or transform the URL.
-            if !entry.is_empty() && name != b"ASTRA_LOGIN_URL" {
-                entries.push(entry);
-            }
-        }
-    }
-    entries.push(b"ASTRA_LOGIN_URL/w");
-    std::ffi::OsString::from_vec(entries.join(&b':'))
-}
-
-pub(crate) fn open_login_url(url: &str) {
-    #[cfg(target_os = "macos")]
-    let result = std::process::Command::new("open").arg(url).spawn();
-    #[cfg(target_os = "linux")]
-    let result = {
-        let wsl = running_in_wsl();
-        let mut command = linux_login_browser_command(url, wsl);
-        if wsl {
-            // Avoid leaking the launcher's diagnostics into the interactive TUI.
-            command
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            command.spawn().or_else(|_| {
-                std::process::Command::new("wslview")
-                    .arg(url)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-            })
-        } else {
-            command.spawn()
-        }
-    };
-    #[cfg(target_os = "windows")]
-    let result = windows_browser_command(url).spawn();
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    let result: std::io::Result<std::process::Child> = Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "browser launch is unsupported",
-    ));
-    if let Err(error) = result {
-        eprintln!("Could not open a browser automatically: {error}");
-    }
-}
-
 fn parse_legacy_login_method(methods: serde_json::Value) -> Result<LoginMethod, String> {
     #[derive(Deserialize)]
     struct Methods {
@@ -867,22 +805,6 @@ fn validate_login_website(value: &str) -> Result<url::Url, String> {
         return Err("Server login URL requires HTTPS (HTTP is allowed only on loopback)".into());
     }
     Ok(url)
-}
-
-#[cfg(any(target_os = "windows", target_os = "linux", test))]
-fn windows_browser_command(url: &str) -> std::process::Command {
-    let mut command = std::process::Command::new("powershell.exe");
-    // The URL is data in the child environment, never shell source. In
-    // particular the callback's &state= cannot become another command.
-    command
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Start-Process -FilePath $env:ASTRA_LOGIN_URL",
-        ])
-        .env("ASTRA_LOGIN_URL", url);
-    command
 }
 
 async fn request_login_tokens(
@@ -1252,10 +1174,31 @@ mod tests {
             let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
             let (sender, receiver) = tokio::sync::oneshot::channel();
             let website_url = website.uri();
-            let login =
-                super::do_memoria_browser_login_with_opener(&api, None, &website_url, |url| {
-                    sender.send(url.to_string()).unwrap();
-                });
+            let sender = std::sync::Mutex::new(Some(sender));
+            let warnings = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed_warnings = warnings.clone();
+            let observer: super::LoginObserver = std::sync::Arc::new(move |progress| {
+                match progress {
+                    super::LoginProgress::OpenBrowser(url) => {
+                        sender.lock().unwrap().take().unwrap().send(url).unwrap();
+                    }
+                    super::LoginProgress::BrowserLaunchFailed(reason) => {
+                        assert!(reason.contains("Use the sign-in link"));
+                        observed_warnings.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        return Err("warning view already closed".into());
+                    }
+                    super::LoginProgress::Completing => {}
+                }
+                Ok(())
+            });
+            let login = super::browser_login_with_launcher(
+                &api,
+                None,
+                super::LoginMethod::Memoria(website_url),
+                observer,
+                false,
+                async |_| Err("test launcher unavailable".into()),
+            );
             let browser = async {
                 let url = url::Url::parse(&receiver.await.unwrap()).unwrap();
                 let fields: std::collections::HashMap<_, _> = url
@@ -1400,7 +1343,8 @@ mod tests {
                 );
             };
             let (result, ()) = tokio::join!(login, browser);
-            assert_eq!(result.unwrap(), "test-access");
+            result.unwrap();
+            assert_eq!(warnings.load(std::sync::atomic::Ordering::SeqCst), 1);
             let profile = load_credentials().profiles.remove("default").unwrap();
             assert_eq!(profile.account_id.as_deref(), Some("browser-user"));
             assert_eq!(profile.access_token.as_deref(), Some("test-access"));
@@ -1704,85 +1648,6 @@ mod tests {
         ] {
             assert!(super::validate_login_website(bad).is_err(), "{bad}");
         }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn wsl_login_uses_windows_browser_without_interpreting_callback_url() {
-        assert!(super::is_wsl_kernel_release(
-            "5.15.167.4-microsoft-standard-WSL2"
-        ));
-        assert!(super::is_wsl_kernel_release("4.4.0-Microsoft"));
-        assert!(!super::is_wsl_kernel_release("6.8.0-generic"));
-        let url =
-            "https://uc.example.com/authorize?client_id=astra-cli&response_type=code&state=abc";
-        let linux = super::linux_login_browser_command_with_wslenv(url, false, None);
-        assert_eq!(linux.get_program(), std::ffi::OsStr::new("xdg-open"));
-        let wsl = super::linux_login_browser_command_with_wslenv(url, true, None);
-        assert_eq!(wsl.get_program(), std::ffi::OsStr::new("powershell.exe"));
-        assert!(wsl.get_envs().any(
-            |(key, value)| key == "ASTRA_LOGIN_URL" && value == Some(std::ffi::OsStr::new(url))
-        ));
-        assert!(wsl.get_envs().any(|(key, value)| {
-            key == "WSLENV" && value == Some(std::ffi::OsStr::new("ASTRA_LOGIN_URL/w"))
-        }));
-        assert!(
-            wsl.get_args()
-                .all(|arg| !arg.to_string_lossy().contains(url))
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn wsl_login_normalizes_forwarded_environment() {
-        for (existing, expected) in [
-            (
-                "WT_SESSION:GTK_MODULES/w",
-                "WT_SESSION:GTK_MODULES/w:ASTRA_LOGIN_URL/w",
-            ),
-            (
-                "WT_SESSION:astra_login_url/p",
-                "WT_SESSION:astra_login_url/p:ASTRA_LOGIN_URL/w",
-            ),
-            ("ASTRA_LOGIN_URL", "ASTRA_LOGIN_URL/w"),
-            ("ASTRA_LOGIN_URL/u", "ASTRA_LOGIN_URL/w"),
-            ("ASTRA_LOGIN_URL/p", "ASTRA_LOGIN_URL/w"),
-            ("ASTRA_LOGIN_URL/l", "ASTRA_LOGIN_URL/w"),
-            (
-                "ASTRA_LOGIN_URL/u:FOO:ASTRA_LOGIN_URL/p",
-                "FOO:ASTRA_LOGIN_URL/w",
-            ),
-            ("FOO:ASTRA_LOGIN_URL/w", "FOO:ASTRA_LOGIN_URL/w"),
-        ] {
-            let command = super::linux_login_browser_command_with_wslenv(
-                "https://uc.example.com/authorize",
-                true,
-                Some(std::ffi::OsStr::new(existing)),
-            );
-            assert!(command.get_envs().any(|(key, value)| {
-                key == "WSLENV" && value == Some(std::ffi::OsStr::new(expected))
-            }));
-        }
-    }
-
-    #[test]
-    fn windows_browser_launch_keeps_callback_url_out_of_shell_source() {
-        let url = "https://thememoria.ai/connect/astra?port=1234&state=abc&cli_version=0.2.1";
-        let command = super::windows_browser_command(url);
-        let args: Vec<_> = command
-            .get_args()
-            .map(|v| v.to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            args.iter()
-                .all(|arg| !arg.contains(url) && !arg.contains("&state"))
-        );
-        assert!(
-            command
-                .get_envs()
-                .any(|(name, value)| name == "ASTRA_LOGIN_URL"
-                    && value == Some(std::ffi::OsStr::new(url)))
-        );
     }
 
     #[tokio::test]

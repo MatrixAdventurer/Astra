@@ -162,6 +162,15 @@ unchanged when no native identity is bound.
 
 Browser login URLs require HTTPS except for explicit loopback development addresses. Windows passes the URL as child-process environment data, not shell source.
 
+Terminal and workbench login share an asynchronous browser-opening boundary.
+On WSL, command-local `WSLENV` forwards the URL unchanged to Windows. PowerShell
+completion determines whether to try `wslview`; each attempt has five seconds
+plus one second for cleanup. Fallback requires collection of the previous
+launcher. Cancelling the login also requests launcher cleanup. Native desktop
+openers retain browser handoff semantics. Opening failures produce a sanitized
+warning while the manual URL and existing callback remain usable; they do not
+authorize or prevent credential exchange. Observers do not wait for processes.
+
 ### Browser-delivered local authorization codes
 
 The CLI binds its existing listener to `127.0.0.1:0`, generates a fresh state
