@@ -2749,12 +2749,12 @@ mod tests {
     #[test]
     fn no_color_headless_lines_are_plain_text() {
         let rendered = [
-            CliServerAdmissionHost::<'_>::render_headless_stderr_line(HeadlessStderrStyle::Dim, "dim", true),
-            CliServerAdmissionHost::<'_>::render_headless_stderr_line(HeadlessStderrStyle::CyanBold, "header", true),
-            CliServerAdmissionHost::<'_>::render_headless_stderr_line(HeadlessStderrStyle::Magenta, "@@ hunk", true),
-            CliServerAdmissionHost::<'_>::render_headless_stderr_line(HeadlessStderrStyle::DiffAdd, "+added", true),
-            CliServerAdmissionHost::<'_>::render_headless_stderr_line(HeadlessStderrStyle::DiffRemove, "-removed", true),
-            CliServerAdmissionHost::<'_>::render_headless_stderr_line(HeadlessStderrStyle::DiffContext, " context", true),
+            super::CliServerAdmissionHost::<'_>::render_headless_stderr_line(HeadlessStderrStyle::Dim, "dim", true),
+            super::CliServerAdmissionHost::<'_>::render_headless_stderr_line(HeadlessStderrStyle::CyanBold, "header", true),
+            super::CliServerAdmissionHost::<'_>::render_headless_stderr_line(HeadlessStderrStyle::Magenta, "@@ hunk", true),
+            super::CliServerAdmissionHost::<'_>::render_headless_stderr_line(HeadlessStderrStyle::DiffAdd, "+added", true),
+            super::CliServerAdmissionHost::<'_>::render_headless_stderr_line(HeadlessStderrStyle::DiffRemove, "-removed", true),
+            super::CliServerAdmissionHost::<'_>::render_headless_stderr_line(HeadlessStderrStyle::DiffContext, " context", true),
         ];
         assert_eq!(
             rendered,
