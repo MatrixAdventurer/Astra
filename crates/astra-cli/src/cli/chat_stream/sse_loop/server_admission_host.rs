@@ -1331,6 +1331,31 @@ impl CliServerAdmissionHost<'_> {
         self.try_emit_stream_event(crate::cli::chat_stream::StreamEvent::SystemWarning(message));
     }
 
+fn render_headless_stderr_line(
+    style: HeadlessStderrStyle,
+    line: &str,
+    _plain: bool,
+) -> String {
+    match style {
+        HeadlessStderrStyle::Dim => line.dim().to_string(),
+        HeadlessStderrStyle::Red => line.red().to_string(),
+        HeadlessStderrStyle::Green => line.green().to_string(),
+        HeadlessStderrStyle::Yellow => line.yellow().to_string(),
+        HeadlessStderrStyle::CyanBold => line.cyan().bold().to_string(),
+        HeadlessStderrStyle::Magenta => format!("{}{}", "│ ".dim(), line.magenta()),
+        HeadlessStderrStyle::DiffAdd => {
+            let body = line.strip_prefix('+').unwrap_or(line);
+            format!("{}{}{}", "│ ".dim(), "+".green().bold(), body.green())
+        }
+        HeadlessStderrStyle::DiffRemove => {
+            let body = line.strip_prefix('-').unwrap_or(line);
+            format!("{}{}{}", "│ ".dim(), "-".red().bold(), body.red())
+        }
+        HeadlessStderrStyle::DiffContext => format!("{}{}", "│ ".dim(), line.dim()),
+        HeadlessStderrStyle::Normal => line.to_string(),
+    }
+}
+
     fn emit_headless_line(&mut self, style: HeadlessStderrStyle, line: String) {
         let permission_event =
             astra_turn_core::permission::notice::parse_auto_approved_permission(&line);
@@ -1345,35 +1370,12 @@ impl CliServerAdmissionHost<'_> {
             self.try_emit_stream_event(stream_event);
             return;
         }
-        let line_ref = line.as_str();
-        match style {
-            HeadlessStderrStyle::Dim => eprintln!("{}", line_ref.dim()),
-            HeadlessStderrStyle::Red => eprintln!("{}", line_ref.red()),
-            HeadlessStderrStyle::Green => eprintln!("{}", line_ref.green()),
-            HeadlessStderrStyle::Yellow => eprintln!("{}", line_ref.yellow()),
-            HeadlessStderrStyle::CyanBold => eprintln!("{}", line_ref.cyan().bold()),
-            HeadlessStderrStyle::Magenta => {
-                eprint!("{}", "│ ".dim());
-                eprintln!("{}", line_ref.magenta());
-            }
-            HeadlessStderrStyle::DiffAdd => {
-                let body = line_ref.strip_prefix('+').unwrap_or(line_ref);
-                eprint!("{}", "│ ".dim());
-                eprint!("{}", "+".green().bold());
-                eprintln!("{}", body.green());
-            }
-            HeadlessStderrStyle::DiffRemove => {
-                let body = line_ref.strip_prefix('-').unwrap_or(line_ref);
-                eprint!("{}", "│ ".dim());
-                eprint!("{}", "-".red().bold());
-                eprintln!("{}", body.red());
-            }
-            HeadlessStderrStyle::DiffContext => {
-                eprint!("{}", "│ ".dim());
-                eprintln!("{}", line_ref.dim());
-            }
-            HeadlessStderrStyle::Normal => eprintln!("{}", line_ref),
-        }
+        let rendered = render_headless_stderr_line(
+            style,
+            line.as_str(),
+            std::env::var_os("NO_COLOR").is_some(),
+        );
+        eprintln!("{rendered}");
         self.pending_clear_lines += 1;
         let stream_event = permission_event.map_or_else(
             || crate::cli::chat_stream::StreamEvent::StatusLine(line),
@@ -2744,4 +2746,24 @@ mod tests {
     // restrictions are *turn-scoped* — added when the turn opens
     // with plan-mode active, removed unconditionally when the turn
     // ends. Same shape as `interaction_scoped_tool_restrictions`.
+    #[test]
+    fn no_color_headless_lines_are_plain_text() {
+        colored::control::set_override(true);
+        let rendered = [
+            render_headless_stderr_line(HeadlessStderrStyle::Dim, "dim", true),
+            render_headless_stderr_line(HeadlessStderrStyle::CyanBold, "header", true),
+            render_headless_stderr_line(HeadlessStderrStyle::Magenta, "@@ hunk", true),
+            render_headless_stderr_line(HeadlessStderrStyle::DiffAdd, "+added", true),
+            render_headless_stderr_line(HeadlessStderrStyle::DiffRemove, "-removed", true),
+            render_headless_stderr_line(HeadlessStderrStyle::DiffContext, " context", true),
+        ];
+        colored::control::unset_override();
+
+        assert_eq!(
+            rendered,
+            ["dim", "header", "│ @@ hunk", "│ +added", "│ -removed", "│  context"]
+        );
+        assert!(rendered.iter().all(|line| !line.contains('\u{1b}')));
+    }
+
 }
