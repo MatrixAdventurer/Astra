@@ -1331,30 +1331,52 @@ impl CliServerAdmissionHost<'_> {
         self.try_emit_stream_event(crate::cli::chat_stream::StreamEvent::SystemWarning(message));
     }
 
-fn render_headless_stderr_line(
-    style: HeadlessStderrStyle,
-    line: &str,
-    _plain: bool,
-) -> String {
-    match style {
-        HeadlessStderrStyle::Dim => line.dim().to_string(),
-        HeadlessStderrStyle::Red => line.red().to_string(),
-        HeadlessStderrStyle::Green => line.green().to_string(),
-        HeadlessStderrStyle::Yellow => line.yellow().to_string(),
-        HeadlessStderrStyle::CyanBold => line.cyan().bold().to_string(),
-        HeadlessStderrStyle::Magenta => format!("{}{}", "│ ".dim(), line.magenta()),
-        HeadlessStderrStyle::DiffAdd => {
-            let body = line.strip_prefix('+').unwrap_or(line);
-            format!("{}{}{}", "│ ".dim(), "+".green().bold(), body.green())
+    fn render_headless_stderr_line(
+        style: HeadlessStderrStyle,
+        line: &str,
+        plain: bool,
+    ) -> String {
+        if plain {
+            return match style {
+                HeadlessStderrStyle::Magenta | HeadlessStderrStyle::DiffContext => {
+                    format!("│ {line}")
+                }
+                HeadlessStderrStyle::DiffAdd => {
+                    let body = line.strip_prefix('+').unwrap_or(line);
+                    format!("│ +{body}")
+                }
+                HeadlessStderrStyle::DiffRemove => {
+                    let body = line.strip_prefix('-').unwrap_or(line);
+                    format!("│ -{body}")
+                }
+                HeadlessStderrStyle::Dim
+                | HeadlessStderrStyle::Red
+                | HeadlessStderrStyle::Green
+                | HeadlessStderrStyle::Yellow
+                | HeadlessStderrStyle::CyanBold
+                | HeadlessStderrStyle::Normal => line.to_string(),
+            };
         }
-        HeadlessStderrStyle::DiffRemove => {
-            let body = line.strip_prefix('-').unwrap_or(line);
-            format!("{}{}{}", "│ ".dim(), "-".red().bold(), body.red())
+
+        match style {
+            HeadlessStderrStyle::Dim => line.dim().to_string(),
+            HeadlessStderrStyle::Red => line.red().to_string(),
+            HeadlessStderrStyle::Green => line.green().to_string(),
+            HeadlessStderrStyle::Yellow => line.yellow().to_string(),
+            HeadlessStderrStyle::CyanBold => line.cyan().bold().to_string(),
+            HeadlessStderrStyle::Magenta => format!("{}{}", "│ ".dim(), line.magenta()),
+            HeadlessStderrStyle::DiffAdd => {
+                let body = line.strip_prefix('+').unwrap_or(line);
+                format!("{}{}{}", "│ ".dim(), "+".green().bold(), body.green())
+            }
+            HeadlessStderrStyle::DiffRemove => {
+                let body = line.strip_prefix('-').unwrap_or(line);
+                format!("{}{}{}", "│ ".dim(), "-".red().bold(), body.red())
+            }
+            HeadlessStderrStyle::DiffContext => format!("{}{}", "│ ".dim(), line.dim()),
+            HeadlessStderrStyle::Normal => line.to_string(),
         }
-        HeadlessStderrStyle::DiffContext => format!("{}{}", "│ ".dim(), line.dim()),
-        HeadlessStderrStyle::Normal => line.to_string(),
     }
-}
 
     fn emit_headless_line(&mut self, style: HeadlessStderrStyle, line: String) {
         let permission_event =
