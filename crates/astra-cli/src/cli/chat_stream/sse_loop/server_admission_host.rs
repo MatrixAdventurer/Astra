@@ -1370,7 +1370,7 @@ fn render_headless_stderr_line(
             self.try_emit_stream_event(stream_event);
             return;
         }
-        let rendered = render_headless_stderr_line(
+        let rendered = Self::render_headless_stderr_line(
             style,
             line.as_str(),
             std::env::var_os("NO_COLOR").is_some(),
@@ -2750,12 +2750,12 @@ mod tests {
     fn no_color_headless_lines_are_plain_text() {
         colored::control::set_override(true);
         let rendered = [
-            render_headless_stderr_line(HeadlessStderrStyle::Dim, "dim", true),
-            render_headless_stderr_line(HeadlessStderrStyle::CyanBold, "header", true),
-            render_headless_stderr_line(HeadlessStderrStyle::Magenta, "@@ hunk", true),
-            render_headless_stderr_line(HeadlessStderrStyle::DiffAdd, "+added", true),
-            render_headless_stderr_line(HeadlessStderrStyle::DiffRemove, "-removed", true),
-            render_headless_stderr_line(HeadlessStderrStyle::DiffContext, " context", true),
+            CliServerAdmissionHost::<'_>::render_headless_stderr_line(HeadlessStderrStyle::Dim, "dim", true),
+            CliServerAdmissionHost::<'_>::render_headless_stderr_line(HeadlessStderrStyle::CyanBold, "header", true),
+            CliServerAdmissionHost::<'_>::render_headless_stderr_line(HeadlessStderrStyle::Magenta, "@@ hunk", true),
+            CliServerAdmissionHost::<'_>::render_headless_stderr_line(HeadlessStderrStyle::DiffAdd, "+added", true),
+            CliServerAdmissionHost::<'_>::render_headless_stderr_line(HeadlessStderrStyle::DiffRemove, "-removed", true),
+            CliServerAdmissionHost::<'_>::render_headless_stderr_line(HeadlessStderrStyle::DiffContext, " context", true),
         ];
         colored::control::unset_override();
 
