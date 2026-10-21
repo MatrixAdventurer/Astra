@@ -2771,16 +2771,47 @@ mod tests {
     #[test]
     fn no_color_headless_lines_are_plain_text() {
         let rendered = [
-            super::CliServerAdmissionHost::<'_>::render_headless_stderr_line(super::HeadlessStderrStyle::Dim, "dim", true),
-            super::CliServerAdmissionHost::<'_>::render_headless_stderr_line(super::HeadlessStderrStyle::CyanBold, "header", true),
-            super::CliServerAdmissionHost::<'_>::render_headless_stderr_line(super::HeadlessStderrStyle::Magenta, "@@ hunk", true),
-            super::CliServerAdmissionHost::<'_>::render_headless_stderr_line(super::HeadlessStderrStyle::DiffAdd, "+added", true),
-            super::CliServerAdmissionHost::<'_>::render_headless_stderr_line(super::HeadlessStderrStyle::DiffRemove, "-removed", true),
-            super::CliServerAdmissionHost::<'_>::render_headless_stderr_line(super::HeadlessStderrStyle::DiffContext, " context", true),
+            super::CliServerAdmissionHost::<'_>::render_headless_stderr_line(
+                super::HeadlessStderrStyle::Dim,
+                "dim",
+                true,
+            ),
+            super::CliServerAdmissionHost::<'_>::render_headless_stderr_line(
+                super::HeadlessStderrStyle::CyanBold,
+                "header",
+                true,
+            ),
+            super::CliServerAdmissionHost::<'_>::render_headless_stderr_line(
+                super::HeadlessStderrStyle::Magenta,
+                "@@ hunk",
+                true,
+            ),
+            super::CliServerAdmissionHost::<'_>::render_headless_stderr_line(
+                super::HeadlessStderrStyle::DiffAdd,
+                "+added",
+                true,
+            ),
+            super::CliServerAdmissionHost::<'_>::render_headless_stderr_line(
+                super::HeadlessStderrStyle::DiffRemove,
+                "-removed",
+                true,
+            ),
+            super::CliServerAdmissionHost::<'_>::render_headless_stderr_line(
+                super::HeadlessStderrStyle::DiffContext,
+                " context",
+                true,
+            ),
         ];
         assert_eq!(
             rendered,
-            ["dim", "header", "│ @@ hunk", "│ +added", "│ -removed", "│  context"]
+            [
+                "dim",
+                "header",
+                "│ @@ hunk",
+                "│ +added",
+                "│ -removed",
+                "│  context"
+            ]
         );
         assert!(rendered.iter().all(|line| !line.contains('\u{1b}')));
     }
