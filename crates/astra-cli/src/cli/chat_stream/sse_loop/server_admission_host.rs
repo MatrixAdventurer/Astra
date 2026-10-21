@@ -1331,11 +1331,7 @@ impl CliServerAdmissionHost<'_> {
         self.try_emit_stream_event(crate::cli::chat_stream::StreamEvent::SystemWarning(message));
     }
 
-    fn render_headless_stderr_line(
-        style: HeadlessStderrStyle,
-        line: &str,
-        plain: bool,
-    ) -> String {
+    fn render_headless_stderr_line(style: HeadlessStderrStyle, line: &str, plain: bool) -> String {
         if plain {
             return match style {
                 HeadlessStderrStyle::Magenta | HeadlessStderrStyle::DiffContext => {
@@ -2816,5 +2812,4 @@ mod tests {
     // restrictions are *turn-scoped* — added when the turn opens
     // with plan-mode active, removed unconditionally when the turn
     // ends. Same shape as `interaction_scoped_tool_restrictions`.
-
 }
