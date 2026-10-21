@@ -41,8 +41,11 @@ class CliSharedTests(unittest.TestCase):
             "cli::edge_lifecycle::native_delivery::tests::discovery_publishes_only_the_first_verified_path_client",
         ]
         for failed_command in ("", "build", "nextest"):
-            with self.subTest(failed_command=failed_command), tempfile.TemporaryDirectory() as directory:
-                fixture = Path(directory)
+            with self.subTest(failed_command=failed_command), \
+                    tempfile.TemporaryDirectory() as directory, \
+                    tempfile.TemporaryDirectory() as alias_directory:
+                fixture = Path(alias_directory) / "fixture"
+                fixture.symlink_to(directory, target_is_directory=True)
                 cargo = fixture / "cargo"
                 cargo.write_text('''#!/usr/bin/env python3
 import json, os, sys
@@ -68,7 +71,10 @@ sys.exit(17 if sys.argv[1] == os.environ["FAIL_COMMAND"] else 0)
                         "nextest run --locked -p astra-cli --lib --profile strict "
                         "--run-ignored only --test-threads 1 --retries 0 -- --exact"
                     ) + expected_tests)
-                    self.assertEqual(supervisor, str(fixture / "target/debug/astra"))
+                    self.assertEqual(
+                        Path(supervisor).resolve(),
+                        (fixture / "target/debug/astra").resolve(),
+                    )
         # The smoke profile must not overwrite the full inventory's CI JUnit file.
         config = tomllib.loads((ROOT / ".config/nextest.toml").read_text())
         self.assertNotIn("junit", config["profile"]["default"])
