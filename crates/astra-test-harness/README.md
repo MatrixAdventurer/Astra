@@ -65,6 +65,13 @@ Revision verification requires the built-in CLI executor and is unavailable in
 dashboard mode. Embedded identity is a build declaration: use the trusted build
 workflow to refresh source metadata, particularly after uncommitted edits;
 this check does not fingerprint runtime configuration or all dependencies.
+Ordinary Cargo builds without a source declaration or valid attestation nonce
+report an unverified (`git_dirty=true`) identity and cannot enter this mode.
+Use the manual harness workflow, or build all compared binaries with a valid
+64-hex `ASTRA_BUILD_ATTESTATION_NONCE`; source-watched builds then detect
+unstaged changes even when that nonce is reused. A trusted source orchestrator
+may instead refresh both `ASTRA_BUILD_SOURCE_GIT_SHA` and
+`ASTRA_BUILD_SOURCE_GIT_DIRTY` for every build, as the manual workflow does.
 Preflight resolves the legacy execution profile before checking health and
 passes that same explicit profile to health, model probes and case execution;
 it does not validate a native MOI endpoint and then execute on a legacy one.
@@ -235,6 +242,13 @@ check results, not a claimed root-cause analysis. Raw prompts, tool/provider bod
 and free-form judge diagnostics remain private; public artifacts do not include
 them. Checks without a safe numeric projection explicitly say that their detailed
 payload is withheld. Full private diagnostics remain in the local suite report.
+
+Prompt-cache scope checks retain their grading-time observation count, post-cold
+cache-read sum, and bounded per-execution capture status, identity-match flags,
+scope count, and cache-read counters. This distinguishes a missing/pending explain
+capture from an observed absence of warm reuse without publishing session/run
+identities, prompt content, provider bodies, or raw capture diagnostics. These
+fields explain the existing verdict; they do not change cache-scope acceptance.
 
 Once execution identity is verified, child-adoption checks publish a closed `child_adoption` diagnostic with status
 `proven`, `contradicted`, or `unavailable`, and a fixed failure reason such as
