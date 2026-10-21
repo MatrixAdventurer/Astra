@@ -2753,21 +2753,6 @@ mod tests {
         );
     }
 
-    // ── Plan-mode restriction lifecycle ─────────────────────────
-    //
-    // Regression for session 19298aea-06de-49bf-a1b5-2873c7e87b9e:
-    // the model entered plan mode, called `exit_plan_mode`, the
-    // overlay flipped perm_manager to Auto on the next turn — but
-    // `restricted_tools` had been `extend()`-ed with the plan-mode
-    // mutating tools and never cleared. The whole rest of the
-    // session, write_file / bash / str_replace stayed restricted,
-    // and the model was reduced to telling the user "please run
-    // these commands yourself".
-    //
-    // The contract the lifecycle helpers below pin: plan-mode
-    // restrictions are *turn-scoped* — added when the turn opens
-    // with plan-mode active, removed unconditionally when the turn
-    // ends. Same shape as `interaction_scoped_tool_restrictions`.
     #[test]
     fn no_color_headless_lines_are_plain_text() {
         let rendered = [
@@ -2815,4 +2800,21 @@ mod tests {
         );
         assert!(rendered.iter().all(|line| !line.contains('\u{1b}')));
     }
+
+    // ── Plan-mode restriction lifecycle ─────────────────────────
+    //
+    // Regression for session 19298aea-06de-49bf-a1b5-2873c7e87b9e:
+    // the model entered plan mode, called `exit_plan_mode`, the
+    // overlay flipped perm_manager to Auto on the next turn — but
+    // `restricted_tools` had been `extend()`-ed with the plan-mode
+    // mutating tools and never cleared. The whole rest of the
+    // session, write_file / bash / str_replace stayed restricted,
+    // and the model was reduced to telling the user "please run
+    // these commands yourself".
+    //
+    // The contract the lifecycle helpers below pin: plan-mode
+    // restrictions are *turn-scoped* — added when the turn opens
+    // with plan-mode active, removed unconditionally when the turn
+    // ends. Same shape as `interaction_scoped_tool_restrictions`.
+
 }
