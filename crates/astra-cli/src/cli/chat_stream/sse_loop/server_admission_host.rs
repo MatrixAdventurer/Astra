@@ -2810,10 +2810,9 @@ mod tests {
                 "│ @@ hunk",
                 "│ +added",
                 "│ -removed",
-                "│  context"
+                "│  context",
             ]
         );
         assert!(rendered.iter().all(|line| !line.contains('\u{1b}')));
     }
-
 }
