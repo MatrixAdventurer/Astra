@@ -2748,7 +2748,6 @@ mod tests {
     // ends. Same shape as `interaction_scoped_tool_restrictions`.
     #[test]
     fn no_color_headless_lines_are_plain_text() {
-        colored::control::set_override(true);
         let rendered = [
             CliServerAdmissionHost::<'_>::render_headless_stderr_line(HeadlessStderrStyle::Dim, "dim", true),
             CliServerAdmissionHost::<'_>::render_headless_stderr_line(HeadlessStderrStyle::CyanBold, "header", true),
@@ -2757,8 +2756,6 @@ mod tests {
             CliServerAdmissionHost::<'_>::render_headless_stderr_line(HeadlessStderrStyle::DiffRemove, "-removed", true),
             CliServerAdmissionHost::<'_>::render_headless_stderr_line(HeadlessStderrStyle::DiffContext, " context", true),
         ];
-        colored::control::unset_override();
-
         assert_eq!(
             rendered,
             ["dim", "header", "│ @@ hunk", "│ +added", "│ -removed", "│  context"]
