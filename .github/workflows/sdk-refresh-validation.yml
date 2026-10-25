@@ -1,5 +1,7 @@
 name: SDK refresh validation
 on:
+  pull_request:
+    branches: [fix/sdk-concurrent-token-refresh]
   push:
     branches: [validate/sdk-refresh-1132]
 permissions:
