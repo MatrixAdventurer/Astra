@@ -627,6 +627,8 @@ export class AstraClient {
   private config: AstraClientConfig;
   private accessToken: string | null;
   private refreshTokenValue: string | null;
+  private authGeneration = 0;
+  private refreshAttempt: { generation: number; promise: Promise<boolean> } | null = null;
 
   constructor(config: AstraClientConfig) {
     this.config = config;
@@ -654,8 +656,7 @@ export class AstraClient {
     const body: Record<string, unknown> = { username, email, password };
     if (options?.displayName) body.display_name = options.displayName;
     const result = await this.post<AuthResult>(PATH_AUTH_REGISTER, body);
-    this.accessToken = result.access_token;
-    this.refreshTokenValue = result.refresh_token;
+    this.setTokens(result.access_token, result.refresh_token);
     return result;
   }
 
@@ -665,13 +666,13 @@ export class AstraClient {
       username,
       password,
     });
-    this.accessToken = result.access_token;
-    this.refreshTokenValue = result.refresh_token;
+    this.setTokens(result.access_token, result.refresh_token);
     return result;
   }
 
   /** Log out and clear stored tokens. Requires refresh token in client state. */
   async logout(): Promise<void> {
+    this.authGeneration++;
     try {
       if (this.refreshTokenValue) {
         await this.post(PATH_AUTH_LOGOUT, {
@@ -679,6 +680,7 @@ export class AstraClient {
         });
       }
     } finally {
+      this.authGeneration++;
       this.accessToken = null;
       this.refreshTokenValue = null;
     }
@@ -743,27 +745,47 @@ export class AstraClient {
   }
 
   setTokens(accessToken: string, refreshToken?: string): void {
+    this.authGeneration++;
     this.accessToken = accessToken;
     if (refreshToken) this.refreshTokenValue = refreshToken;
   }
 
-  private async tryRefreshToken(): Promise<boolean> {
+  private async tryRefreshToken(generation: number, rejectedToken: string | null): Promise<boolean> {
+    if (generation !== this.authGeneration) return false;
+    if (this.refreshAttempt?.generation === generation) return this.refreshAttempt.promise;
+    // A delayed 401 may belong to a token another request already rotated.
+    if (rejectedToken !== this.accessToken) return true;
     if (!this.refreshTokenValue) return false;
+    const attempt = {
+      generation,
+      promise: this.refreshTokens(generation, this.refreshTokenValue),
+    };
+    this.refreshAttempt = attempt;
+    try {
+      return await attempt.promise;
+    } finally {
+      // An older account's completion must not clear a newer refresh attempt.
+      if (this.refreshAttempt === attempt) this.refreshAttempt = null;
+    }
+  }
+
+  private async refreshTokens(generation: number, refreshToken: string): Promise<boolean> {
     try {
       const res = await fetch(this.apiPath(PATH_AUTH_REFRESH), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ refresh_token: this.refreshTokenValue }),
+        body: JSON.stringify({ refresh_token: refreshToken }),
       });
       if (!res.ok) return false;
       const data = (await res.json()) as AuthResult;
+      if (generation !== this.authGeneration) return false;
       this.accessToken = data.access_token;
       this.refreshTokenValue = data.refresh_token;
       await this.config.onTokenRefresh?.({
         accessToken: data.access_token,
         refreshToken: data.refresh_token,
       });
-      return true;
+      return generation === this.authGeneration;
     } catch {
       return false;
     }
@@ -795,14 +817,16 @@ export class AstraClient {
 
   private async request(path: string, init?: RequestInit): Promise<Response> {
     const url = this.apiPath(path);
+    const generation = this.authGeneration;
+    const accessToken = this.accessToken;
     let res = await fetch(url, {
       ...init,
       headers: headersInitToRecord(this.buildHeaders(init), init?.headers),
     });
 
     if (res.status === 401) {
-      const refreshed = await this.tryRefreshToken();
-      if (refreshed) {
+      const refreshed = await this.tryRefreshToken(generation, accessToken);
+      if (refreshed && generation === this.authGeneration) {
         res = await fetch(url, {
           ...init,
           headers: headersInitToRecord(this.buildHeaders(init), init?.headers),
@@ -3061,14 +3085,16 @@ export class AstraClient {
   async getRunEvents(runId: string, startIndex = 0): Promise<StreamEvent[]> {
     const path = `${chatRunStreamPath(runId)}?last_index=${encodeURIComponent(String(startIndex))}`;
     const url = this.apiPath(path);
+    const generation = this.authGeneration;
+    const accessToken = this.accessToken;
     const streamHeaders = this.buildHeaders(undefined, {
       Accept: "text/event-stream",
     });
     let res = await fetch(url, { headers: streamHeaders });
 
     if (res.status === 401) {
-      const refreshed = await this.tryRefreshToken();
-      if (refreshed) {
+      const refreshed = await this.tryRefreshToken(generation, accessToken);
+      if (refreshed && generation === this.authGeneration) {
         res = await fetch(url, {
           headers: this.buildHeaders(undefined, {
             Accept: "text/event-stream",
