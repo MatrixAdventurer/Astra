@@ -243,6 +243,10 @@ export class WebRuntimeClient {
   ): Promise<void> {
     const { cookies } = await import("next/headers");
     const cookieStore = await cookies();
+    // A newer refresh may have replaced this pair while cookie acquisition waited.
+    if (this.accessToken !== accessToken || this.refreshToken !== refreshToken) {
+      return;
+    }
     cookieStore.set(ACCESS_TOKEN_COOKIE, accessToken, {
       httpOnly: true,
       sameSite: "lax",

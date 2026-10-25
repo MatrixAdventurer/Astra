@@ -171,6 +171,8 @@ This coordination is per client instance, not across separate BFF requests.
 awaiting its rotation still wait for the callback. Callback failure preserves
 the rotated credentials and returns those callers' original authentication
 error. Notifications from successive rotations may overlap.
+The Web runtime client persists a captured pair only if it still matches that
+instance's current credentials after asynchronous cookie acquisition.
 
 Buffered `getRunEvents` uses the same authenticated request and structured
 `AstraApiError` decoding as REST, including error codes and action hints.
