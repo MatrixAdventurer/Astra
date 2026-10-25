@@ -127,3 +127,161 @@ test.each(['setTokens', 'login', 'register', 'logout'] as const)(
     );
   },
 );
+
+test('an async notification can receive 401 without blocking its callers or later recovery', async () => {
+  const refreshTokens: string[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (url.endsWith('/auth/refresh')) {
+      refreshTokens.push(JSON.parse(String(init?.body)).refresh_token);
+      if (refreshTokens.length === 2) return Response.json({}, { status: 503 });
+      return Response.json(refreshTokens.length === 1 ? rotated
+        : { access_token: 'recovered-access', refresh_token: 'recovered-refresh' });
+    }
+    return authorization(init) === 'Bearer recovered-access'
+      ? Response.json({ user_id: 'alice' }) : unauthorized();
+  }));
+  const onTokenRefresh = vi.fn(async () => { await client.getMe(); });
+  const client = new AstraClient({
+    baseUrl: 'https://example.test', accessToken: 'old-access',
+    refreshToken: 'old-refresh', onTokenRefresh,
+  });
+  const results = await Promise.allSettled([client.getMe(), client.getRunEvents('run-1')]);
+  expect(results.map(result => result.status)).toEqual(['rejected', 'rejected']);
+  expect(refreshTokens).toEqual(['old-refresh', 'new-refresh']);
+  expect(onTokenRefresh).toHaveBeenCalledTimes(1);
+  await expect(client.getMe()).resolves.toEqual({ user_id: 'alice' });
+  expect(refreshTokens).toEqual(['old-refresh', 'new-refresh', 'new-refresh']);
+  expect(onTokenRefresh).toHaveBeenCalledTimes(2);
+});
+
+test('a successful nested refresh still permits only one replay of the buffered SSE request', async () => {
+  const refreshTokens: string[] = [];
+  const callbackResults: unknown[] = [];
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    if (url.endsWith('/auth/refresh')) {
+      refreshTokens.push(JSON.parse(String(init?.body)).refresh_token);
+      return Response.json(refreshTokens.length === 1 ? rotated
+        : { access_token: 'recovered-access', refresh_token: 'recovered-refresh' });
+    }
+    return url.endsWith('/auth/me') && authorization(init) === 'Bearer recovered-access'
+      ? Response.json({ user_id: 'alice' }) : unauthorized();
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  const onTokenRefresh = vi.fn(async () => { callbackResults.push(await client.getMe()); });
+  const client = new AstraClient({
+    baseUrl: 'https://example.test', accessToken: 'old-access',
+    refreshToken: 'old-refresh', onTokenRefresh,
+  });
+  await expect(client.getRunEvents('run-1')).rejects.toMatchObject({ status: 401 });
+  expect(refreshTokens).toEqual(['old-refresh', 'new-refresh']);
+  expect(callbackResults).toEqual([{ user_id: 'alice' }, { user_id: 'alice' }]);
+  expect(onTokenRefresh).toHaveBeenCalledTimes(2);
+  const streamRequests = fetchMock.mock.calls.filter(([url]) => url.includes('/stream'));
+  expect(streamRequests.map(([, init]) => authorization(init))).toEqual([
+    'Bearer old-access', 'Bearer recovered-access',
+  ]);
+  expect(streamRequests.every(([, init]) => new Headers(init?.headers).get('Accept') === 'text/event-stream')).toBe(true);
+});
+
+test('already joined callers await an async notification that successfully reenters the client', async () => {
+  const notification = deferred<void>();
+  const entered = deferred<void>();
+  const settled = vi.fn();
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (url.endsWith('/auth/refresh')) return Response.json(rotated);
+    if (authorization(init) === 'Bearer old-access') return unauthorized();
+    return url.includes('/stream') ? new Response('data: {"type":"run_finished"}\n\n')
+      : Response.json({ user_id: 'alice' });
+  }));
+  const onTokenRefresh = vi.fn(async () => {
+    await client.getMe();
+    entered.resolve();
+    await notification.promise;
+  });
+  const client = new AstraClient({
+    baseUrl: 'https://example.test', accessToken: 'old-access',
+    refreshToken: 'old-refresh', onTokenRefresh,
+  });
+  const results = Promise.allSettled([client.getMe(), client.getRunEvents('run-1')]
+    .map(request => request.then(settled, settled)));
+  await entered.promise;
+  expect(settled).not.toHaveBeenCalled();
+  notification.resolve();
+  await results;
+  expect(settled).toHaveBeenCalledTimes(2);
+  expect(settled).toHaveBeenCalledWith({ user_id: 'alice' });
+  expect(settled).toHaveBeenCalledWith([{ type: 'run_finished' }]);
+  expect(onTokenRefresh).toHaveBeenCalledTimes(1);
+});
+
+test.each(['throw', 'reject'] as const)('a notification %s settles joined callers and preserves rotated credentials', async failure => {
+  const refresh = deferred<Response>();
+  const refreshTokens: string[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (url.endsWith('/auth/refresh')) {
+      refreshTokens.push(JSON.parse(String(init?.body)).refresh_token);
+      return refreshTokens.length === 1 ? refresh.promise
+        : Response.json({ access_token: 'recovered-access', refresh_token: 'recovered-refresh' });
+    }
+    return authorization(init) === 'Bearer recovered-access'
+      ? Response.json({ user_id: 'alice' }) : unauthorized();
+  }));
+  const onTokenRefresh = vi.fn(() => {
+    if (onTokenRefresh.mock.calls.length > 1) return;
+    const error = new Error('notification failed');
+    if (failure === 'throw') throw error;
+    return Promise.reject(error);
+  });
+  const client = new AstraClient({
+    baseUrl: 'https://example.test', accessToken: 'old-access',
+    refreshToken: 'old-refresh', onTokenRefresh,
+  });
+  const results = Promise.allSettled([client.getMe(), client.getRunEvents('run-1')]);
+  await vi.waitFor(() => expect(refreshTokens).toHaveLength(1));
+  refresh.resolve(Response.json(rotated));
+  expect((await results).map(result => result.status)).toEqual(['rejected', 'rejected']);
+  await expect(client.getMe()).resolves.toEqual({ user_id: 'alice' });
+  expect(refreshTokens).toEqual(['old-refresh', 'new-refresh']);
+  expect(onTokenRefresh).toHaveBeenCalledTimes(2);
+});
+
+test('an older notification cannot replay across accounts or release a newer refresh', async () => {
+  const notification = deferred<void>();
+  const notified = deferred<void>();
+  const bobRefresh = deferred<Response>();
+  const bobRefreshing = deferred<void>();
+  const refreshTokens: string[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (url.endsWith('/auth/refresh')) {
+      const token = JSON.parse(String(init?.body)).refresh_token;
+      refreshTokens.push(token);
+      if (token === 'old-refresh') return Response.json(rotated);
+      bobRefreshing.resolve();
+      return bobRefresh.promise;
+    }
+    return authorization(init) === 'Bearer bob-access'
+      ? Response.json({ user_id: 'bob' }) : unauthorized();
+  }));
+  const onTokenRefresh = vi.fn(async ({ accessToken }: { accessToken: string }) => {
+    if (accessToken !== 'new-access') return;
+    notified.resolve();
+    await notification.promise;
+  });
+  const client = new AstraClient({
+    baseUrl: 'https://example.test', accessToken: 'old-access',
+    refreshToken: 'old-refresh', onTokenRefresh,
+  });
+  const alice = Promise.allSettled([client.getMe()]);
+  await notified.promise;
+  client.setTokens('bob-expired', 'bob-refresh');
+  const firstBob = client.getMe();
+  await bobRefreshing.promise;
+  notification.resolve();
+  expect((await alice)[0].status).toBe('rejected');
+  const secondBob = client.getMe();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  expect(refreshTokens).toEqual(['old-refresh', 'bob-refresh']);
+  bobRefresh.resolve(Response.json({ access_token: 'bob-access', refresh_token: 'bob-new-refresh' }));
+  expect(await Promise.all([firstBob, secondBob])).toEqual([{ user_id: 'bob' }, { user_id: 'bob' }]);
+  expect(onTokenRefresh).toHaveBeenCalledTimes(2);
+});

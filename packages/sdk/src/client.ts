@@ -242,7 +242,6 @@ import { SSEClient, parseSseDataEvents } from "./sse-client";
 import {
   headersInitToRecord,
   readAstraError,
-  readAstraErrorDetail,
 } from "./http";
 import { modelSelectionToWire } from "./wire";
 import {
@@ -781,6 +780,8 @@ export class AstraClient {
       if (generation !== this.authGeneration) return false;
       this.accessToken = data.access_token;
       this.refreshTokenValue = data.refresh_token;
+      // Notification may reenter the client and need another refresh.
+      this.refreshAttempt = null;
       await this.config.onTokenRefresh?.({
         accessToken: data.access_token,
         refreshToken: data.refresh_token,
@@ -3084,29 +3085,9 @@ export class AstraClient {
    */
   async getRunEvents(runId: string, startIndex = 0): Promise<StreamEvent[]> {
     const path = `${chatRunStreamPath(runId)}?last_index=${encodeURIComponent(String(startIndex))}`;
-    const url = this.apiPath(path);
-    const generation = this.authGeneration;
-    const accessToken = this.accessToken;
-    const streamHeaders = this.buildHeaders(undefined, {
-      Accept: "text/event-stream",
+    const res = await this.request(path, {
+      headers: { Accept: "text/event-stream" },
     });
-    let res = await fetch(url, { headers: streamHeaders });
-
-    if (res.status === 401) {
-      const refreshed = await this.tryRefreshToken(generation, accessToken);
-      if (refreshed && generation === this.authGeneration) {
-        res = await fetch(url, {
-          headers: this.buildHeaders(undefined, {
-            Accept: "text/event-stream",
-          }),
-        });
-      }
-    }
-
-    if (!res.ok) {
-      const body = await readAstraErrorDetail(res);
-      throw new AstraApiError(res.status, body, path);
-    }
 
     // Response.text() strips a BOM before the shared parser can apply its rule.
     const text = new TextDecoder("utf-8", { ignoreBOM: true }).decode(await res.arrayBuffer());
