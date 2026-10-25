@@ -174,6 +174,19 @@ error. Notifications from successive rotations may overlap.
 The Web runtime client persists a captured pair only if it still matches that
 instance's current credentials after asynchronous cookie acquisition.
 
+The Web runtime's raw HTTP requests share this SDK refresh owner. Its API URL
+is origin-relative: a pathname suffix is not a gateway prefix. Standalone SDK
+`baseUrl` and `pathPrefix` routing are unchanged. Web refresh or notification
+failure returns the original 401, which its typed adapter converts to a runtime
+error; initial transport errors still propagate.
+
+`fetchResponse(path, init, { auth })` returns an unconsumed response, including
+non-2xx responses, without inferring a JSON content type. Its default auth is
+`"optional"`; `"none"` suppresses default authorization and automatic refresh.
+Explicit request headers still override defaults. `getTokens()` returns a
+detached snapshot of current credentials, not the initial configuration.
+Bodies must remain replayable for the single automatic retry.
+
 Buffered `getRunEvents` uses the same authenticated request and structured
 `AstraApiError` decoding as REST, including error codes and action hints.
 

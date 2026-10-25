@@ -749,6 +749,11 @@ export class AstraClient {
     if (refreshToken) this.refreshTokenValue = refreshToken;
   }
 
+  /** A detached snapshot of the credentials currently owned by this client. */
+  getTokens(): Readonly<{ accessToken: string | null; refreshToken: string | null }> {
+    return { accessToken: this.accessToken, refreshToken: this.refreshTokenValue };
+  }
+
   private async tryRefreshToken(generation: number, rejectedToken: string | null): Promise<boolean> {
     if (generation !== this.authGeneration) return false;
     if (this.refreshAttempt?.generation === generation) return this.refreshAttempt.promise;
@@ -774,10 +779,16 @@ export class AstraClient {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ refresh_token: refreshToken }),
+        cache: "no-store",
       });
       if (!res.ok) return false;
       const data = (await res.json()) as AuthResult;
-      if (generation !== this.authGeneration) return false;
+      if (
+        generation !== this.authGeneration ||
+        !data ||
+        typeof data.access_token !== "string" ||
+        typeof data.refresh_token !== "string"
+      ) return false;
       this.accessToken = data.access_token;
       this.refreshTokenValue = data.refresh_token;
       // Notification may reenter the client and need another refresh.
@@ -792,48 +803,44 @@ export class AstraClient {
     }
   }
 
-  private buildHeaders(
-    init?: RequestInit,
-    extra?: Record<string, string>,
-  ): Record<string, string> {
-    const headers = headersInitToRecord(this.config.headers ?? {}, extra);
-    const generated: Record<string, string> = {};
-    const method = (init?.method ?? "GET").toUpperCase();
-    if (
-      init?.body != null &&
-      (method === "POST" ||
-        method === "PUT" ||
-        method === "PATCH" ||
-        method === "DELETE")
-    ) {
-      generated["Content-Type"] = "application/json";
-    }
-    if (this.accessToken) {
-      generated["Authorization"] = `Bearer ${this.accessToken}`;
-    }
-    return headersInitToRecord(headers, generated);
+  private buildHeaders(auth: "optional" | "none"): Record<string, string> {
+    const headers = new Headers(headersInitToRecord(this.config.headers ?? {}));
+    if (auth === "none") headers.delete("Authorization");
+    else if (this.accessToken) headers.set("Authorization", `Bearer ${this.accessToken}`);
+    return headersInitToRecord({}, headers);
   }
 
   // ─── HTTP helpers ──────────────────────────────────────────────────
 
-  private async request(path: string, init?: RequestInit): Promise<Response> {
+  /** Raw, body-neutral transport; returns the final response without consuming it. */
+  async fetchResponse(
+    path: string,
+    init?: RequestInit,
+    options?: { auth?: "optional" | "none" },
+  ): Promise<Response> {
+    const auth = options?.auth ?? "optional";
     const url = this.apiPath(path);
     const generation = this.authGeneration;
     const accessToken = this.accessToken;
-    let res = await fetch(url, {
+    const send = () => fetch(url, {
       ...init,
-      headers: headersInitToRecord(this.buildHeaders(init), init?.headers),
+      headers: headersInitToRecord(this.buildHeaders(auth), init?.headers),
     });
-
-    if (res.status === 401) {
+    let res = await send();
+    if (res.status === 401 && auth !== "none") {
       const refreshed = await this.tryRefreshToken(generation, accessToken);
-      if (refreshed && generation === this.authGeneration) {
-        res = await fetch(url, {
-          ...init,
-          headers: headersInitToRecord(this.buildHeaders(init), init?.headers),
-        });
-      }
+      if (refreshed && generation === this.authGeneration) res = await send();
     }
+    return res;
+  }
+
+  private async request(path: string, init?: RequestInit): Promise<Response> {
+    const method = (init?.method ?? "GET").toUpperCase();
+    const json = init?.body != null && ["POST", "PUT", "PATCH", "DELETE"].includes(method);
+    const res = await this.fetchResponse(path, {
+      ...init,
+      headers: headersInitToRecord(json ? { "Content-Type": "application/json" } : {}, init?.headers),
+    });
 
     if (!res.ok) {
       const error = await readAstraError(res);
