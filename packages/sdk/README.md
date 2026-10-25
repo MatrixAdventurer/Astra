@@ -161,6 +161,12 @@ already accepted frame to other subscribed callbacks.
 
 ### Browser apps and the BFF pattern
 
+Within one `AstraClient`, concurrent REST and buffered run-event requests share
+one token refresh. A delayed 401 reuses the rotated token. Refresh responses
+started before `setTokens`, successful login/registration, or logout cannot
+restore the previous credentials or retry an old request under a new account.
+This coordination is per client instance, not across separate BFF requests.
+
 Do not expose long-lived **refresh tokens** in browser-accessible JavaScript.
 The dashboard (`web/`) keeps tokens in **httpOnly cookies** and routes browser
 requests through explicit **Next.js Route Handlers** such as `/api/chats`,
