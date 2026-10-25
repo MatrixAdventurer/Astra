@@ -1,0 +1,27 @@
+name: SDK refresh validation
+on:
+  pull_request:
+    branches: [fix/sdk-concurrent-token-refresh]
+  push:
+    branches: [validate/sdk-refresh-1132]
+permissions:
+  contents: read
+jobs:
+  sdk-web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: MatrixAdventurer/Astra
+          ref: cebc33e24fdb6f0bba29d696940ee6f15d4e4c08
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - run: npm ci && npm run ci
+        working-directory: packages/sdk
+        env:
+          ASTRA_SDK_E2E: "1"
+      - run: npm ci && npm run ci
+        working-directory: web
