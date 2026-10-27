@@ -6,6 +6,72 @@ use astra_services::{
     DatabaseAuthService, RetentionPolicy, cleanup_expired_data,
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use std::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use tracing_subscriber::prelude::*;
+
+#[derive(Default)]
+struct AccountLockGate {
+    armed: AtomicBool,
+    acquired: tokio::sync::Notify,
+    released: Mutex<bool>,
+    wake: Condvar,
+}
+
+impl AccountLockGate {
+    fn arm(&self) {
+        *self.released.lock().unwrap() = false;
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.wake.notify_all();
+    }
+}
+
+struct PauseAccountLock(Arc<AccountLockGate>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PauseAccountLock {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if event.metadata().target() != "sqlx::query" || !self.0.armed.load(Ordering::SeqCst) {
+            return;
+        }
+        #[derive(Default)]
+        struct Fields(String);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, _: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push_str(&format!("{value:?}"));
+            }
+        }
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        if fields
+            .0
+            .contains("SELECT user_id FROM auth_users WHERE user_id = ? FOR UPDATE")
+            && self.0.armed.swap(false, Ordering::SeqCst)
+        {
+            self.0.acquired.notify_one();
+            tokio::task::block_in_place(|| {
+                let (released, timeout) = self
+                    .0
+                    .wake
+                    .wait_timeout_while(
+                        self.0.released.lock().unwrap(),
+                        std::time::Duration::from_secs(20),
+                        |released| !*released,
+                    )
+                    .unwrap();
+                assert!(
+                    *released && !timeout.timed_out(),
+                    "account lock barrier timed out"
+                );
+            });
+        }
+    }
+}
 
 fn headers(token: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -19,6 +85,11 @@ fn headers(token: &str) -> HeaderMap {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires live MatrixOne: ASTRA_TEST_DB_IT=1"]
 async fn logout_revokes_the_session_across_refresh_rotation_without_revoking_other_sessions() {
+    let gate = Arc::new(AccountLockGate::default());
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::registry().with(PauseAccountLock(gate.clone())),
+    )
+    .expect("this test binary owns its tracing subscriber");
     let (pool, settings) = common::setup_pool_and_settings().await;
     let service = DatabaseAuthService::new(
         settings,
@@ -53,7 +124,27 @@ async fn logout_revokes_the_session_across_refresh_rotation_without_revoking_oth
         .await
         .unwrap();
     let other = service.login(login()).await.unwrap();
-    for invalid in [original.access_token.clone(), "invalid.token".to_string()] {
+    let key = b"isolated-logout-rotation-test-key";
+    let mut expired_claims = jsonwebtoken::decode::<serde_json::Value>(
+        &original.refresh_token,
+        &jsonwebtoken::DecodingKey::from_secret(key),
+        &jsonwebtoken::Validation::default(),
+    )
+    .unwrap()
+    .claims;
+    // This is inside the JWT library's usual expiry leeway.
+    expired_claims["exp"] = (chrono::Utc::now().timestamp() - 1).into();
+    let expired = jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &expired_claims,
+        &jsonwebtoken::EncodingKey::from_secret(key),
+    )
+    .unwrap();
+    for invalid in [
+        original.access_token.clone(),
+        "invalid.token".to_string(),
+        expired,
+    ] {
         assert_eq!(
             service
                 .logout(AuthRefreshRequestData {
@@ -65,7 +156,7 @@ async fn logout_revokes_the_session_across_refresh_rotation_without_revoking_oth
             StatusCode::UNAUTHORIZED
         );
     }
-    let rotated = service
+    let mut rotated = service
         .refresh(AuthRefreshRequestData {
             refresh_token: original.refresh_token.clone(),
         })
@@ -81,7 +172,16 @@ async fn logout_revokes_the_session_across_refresh_rotation_without_revoking_oth
             .0,
         StatusCode::UNAUTHORIZED
     );
-    // The old token's revoked row may be removed even though its JWT is still valid.
+    // Repeated rotations replace the same session row rather than retaining a
+    // historical row for every consumed token.
+    for _ in 0..3 {
+        rotated = service
+            .refresh(AuthRefreshRequestData {
+                refresh_token: rotated.refresh_token,
+            })
+            .await
+            .unwrap();
+    }
     let cleanup = cleanup_expired_data(pool.get(), &RetentionPolicy::default())
         .await
         .unwrap();
@@ -90,25 +190,22 @@ async fn logout_revokes_the_session_across_refresh_rotation_without_revoking_oth
             .iter()
             .any(|result| result.table == "auth_refresh_tokens")
     );
-    let retained: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM auth_refresh_tokens WHERE user_id = ? AND is_revoked = 1",
-    )
-    .bind(&user.user_id)
-    .fetch_one(pool.get())
-    .await
-    .unwrap();
-    assert_eq!(
-        retained, 1,
-        "cleanup must retain an unexpired rotated token"
-    );
+    let retained: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM auth_refresh_tokens WHERE user_id = ?")
+            .bind(&user.user_id)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+    assert_eq!(retained, 2, "two sessions retain only one refresh row each");
     service
         .logout(AuthRefreshRequestData {
             refresh_token: original.refresh_token.clone(),
         })
         .await
         .unwrap();
-    // Once the expired record is beyond retention, cleanup must remove it.
-    sqlx::query("UPDATE auth_refresh_tokens SET expires_at = DATE_SUB(NOW(6), INTERVAL 8 DAY) WHERE user_id = ? AND is_revoked = 1 AND created_at < DATE_SUB(NOW(6), INTERVAL 7 DAY)")
+    // An old signed proof still revokes the current row even though its own
+    // hash disappeared on rotation. Revoked rows are eligible after retention.
+    sqlx::query("UPDATE auth_refresh_tokens SET created_at = DATE_SUB(NOW(6), INTERVAL 8 DAY) WHERE user_id = ? AND is_revoked = 1")
         .bind(&user.user_id)
         .execute(pool.get())
         .await
@@ -144,41 +241,115 @@ async fn logout_revokes_the_session_across_refresh_rotation_without_revoking_oth
         .await
         .expect("another session remains active");
 
-    // Exercise simultaneous refresh and logout with three independently issued sessions.
-    // Whichever transaction wins, no successor from that session may stay usable.
-    for _ in 0..3 {
+    let concurrent = service.login(login()).await.unwrap();
+    let (left, right) = tokio::join!(
+        service.refresh(AuthRefreshRequestData {
+            refresh_token: concurrent.refresh_token.clone()
+        }),
+        service.refresh(AuthRefreshRequestData {
+            refresh_token: concurrent.refresh_token.clone()
+        }),
+    );
+    let next = match (left, right) {
+        (Ok(next), Err(error)) | (Err(error), Ok(next)) => {
+            assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+            next
+        }
+        _ => panic!("a single-use refresh token must have exactly one winner"),
+    };
+    service
+        .logout(AuthRefreshRequestData {
+            refresh_token: concurrent.refresh_token,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        service
+            .refresh(AuthRefreshRequestData {
+                refresh_token: next.refresh_token
+            })
+            .await
+            .unwrap_err()
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Pause the winner after it acquires the real account lock so both orders
+    // are exercised without depending on task scheduling.
+    for refresh_first in [true, false] {
         let token = service.login(login()).await.unwrap();
-        let (refreshed, logged_out) = tokio::join!(
-            service.refresh(AuthRefreshRequestData {
-                refresh_token: token.refresh_token.clone()
-            }),
-            service.logout(AuthRefreshRequestData {
-                refresh_token: token.refresh_token.clone()
-            }),
-        );
-        logged_out.unwrap();
-        match refreshed {
-            Ok(next) => {
-                assert_eq!(
-                    service
-                        .refresh(AuthRefreshRequestData {
-                            refresh_token: next.refresh_token
-                        })
-                        .await
-                        .unwrap_err()
-                        .0,
-                    StatusCode::UNAUTHORIZED
-                );
-                assert_eq!(
-                    service
-                        .current_principal(&headers(&next.access_token))
-                        .await
-                        .unwrap_err()
-                        .0,
-                    StatusCode::UNAUTHORIZED
-                );
+        gate.arm();
+        let winner_service = service.clone();
+        let winner_token = token.refresh_token.clone();
+        let winner = tokio::spawn(async move {
+            if refresh_first {
+                winner_service
+                    .refresh(AuthRefreshRequestData {
+                        refresh_token: winner_token,
+                    })
+                    .await
+                    .map(Some)
+            } else {
+                winner_service
+                    .logout(AuthRefreshRequestData {
+                        refresh_token: winner_token,
+                    })
+                    .await
+                    .map(|()| None)
             }
-            Err(error) => assert_eq!(error.0, StatusCode::UNAUTHORIZED),
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(15), gate.acquired.notified())
+            .await
+            .unwrap();
+        let other_service = service.clone();
+        let other_token = token.refresh_token.clone();
+        let mut loser = tokio::spawn(async move {
+            if refresh_first {
+                other_service
+                    .logout(AuthRefreshRequestData {
+                        refresh_token: other_token,
+                    })
+                    .await
+                    .map(|()| None)
+            } else {
+                other_service
+                    .refresh(AuthRefreshRequestData {
+                        refresh_token: other_token,
+                    })
+                    .await
+                    .map(Some)
+            }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut loser)
+                .await
+                .is_err()
+        );
+        gate.release();
+        let first = winner.await.unwrap().unwrap();
+        let second = loser.await.unwrap();
+        if let Some(next) = first {
+            second.unwrap();
+            assert_eq!(
+                service
+                    .refresh(AuthRefreshRequestData {
+                        refresh_token: next.refresh_token
+                    })
+                    .await
+                    .unwrap_err()
+                    .0,
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                service
+                    .current_principal(&headers(&next.access_token))
+                    .await
+                    .unwrap_err()
+                    .0,
+                StatusCode::UNAUTHORIZED
+            );
+        } else {
+            assert_eq!(second.unwrap_err().0, StatusCode::UNAUTHORIZED);
         }
         service
             .current_principal(&headers(&other.access_token))

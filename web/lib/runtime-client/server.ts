@@ -190,12 +190,12 @@ export class WebRuntimeClient {
     if (current.accessToken !== accessToken || current.refreshToken !== refreshToken) {
       return;
     }
-    cookieStore.set(ACCESS_TOKEN_COOKIE, accessToken, {
+    cookieStore.set(REFRESH_TOKEN_COOKIE, refreshToken, {
       httpOnly: true,
       sameSite: "lax",
       path: "/",
     });
-    cookieStore.set(REFRESH_TOKEN_COOKIE, refreshToken, {
+    cookieStore.set(ACCESS_TOKEN_COOKIE, accessToken, {
       httpOnly: true,
       sameSite: "lax",
       path: "/",

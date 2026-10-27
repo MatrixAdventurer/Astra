@@ -186,9 +186,11 @@ test('aborted waiters release their registrations even when refresh never settle
     await expect(request).rejects.toBe(reason);
     expect(removed).toHaveBeenCalledWith('abort', expect.any(Function));
   }
-  const attempt = (client as unknown as { refreshAttempt: { waiters: Set<unknown> } }).refreshAttempt;
-  expect(attempt.waiters.size).toBe(0);
+  const remaining = client.fetchResponse('/remaining');
+  await vi.waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalledTimes(22));
   refresh.resolve(Response.json(tokens));
+  expect((await remaining).status).toBe(401);
+  expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith('/auth/refresh'))).toHaveLength(1);
 });
 
 test('closing a stream while refresh is pending prevents a second POST', async () => {

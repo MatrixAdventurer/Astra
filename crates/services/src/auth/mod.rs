@@ -1799,33 +1799,26 @@ impl AuthService for DatabaseAuthService {
             .fetch_one(&mut *tx)
             .await
             .map_err(internal_error)?;
-        // A concurrent disconnect revokes this row under the same user lock;
-        // the compare-and-revoke prevents refresh from resurrecting it.
-        let revoked = query(
-            "UPDATE auth_refresh_tokens SET is_revoked = 1 WHERE token_hash = ? AND is_revoked = 0",
+        // Replace the current token under the account lock. The old hash no
+        // longer matches, so refresh and disconnect still have one winner.
+        let rotated = query(
+            "UPDATE auth_refresh_tokens SET token_hash = ?, expires_at = ?, created_at = NOW(6), token_prefix = NULL \
+             WHERE token_hash = ? AND user_id = ? AND session_id = ? AND is_revoked = 0",
         )
+        .bind(&new_refresh_token_hash)
+        .bind(expires_at)
         .bind(&refresh_token_hash)
+        .bind(&user_id)
+        .bind(&session_id)
         .execute(&mut *tx)
         .await
-        .map_err(|e| map_auth_sqlx(e, "refresh.revoke_old_token", Some(&pool)))?;
-        if revoked.rows_affected() != 1 {
+        .map_err(|e| map_auth_sqlx(e, "refresh.rotate_token", Some(&pool)))?;
+        if rotated.rows_affected() != 1 {
             return Err(error_response(
                 StatusCode::UNAUTHORIZED,
                 "Token expired or revoked",
             ));
         }
-        query(
-            "INSERT INTO auth_refresh_tokens (token_id, user_id, session_id, token_hash, expires_at, is_revoked) \
-             VALUES (?, ?, ?, ?, ?, 0)",
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(&user.user_id)
-        .bind(&session_id)
-        .bind(&new_refresh_token_hash)
-        .bind(expires_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| map_auth_sqlx(e, "refresh.insert_new_refresh_token", Some(&pool)))?;
         tx.commit()
             .await
             .map_err(|e| map_auth_sqlx(e, "refresh.commit_tx", Some(&pool)))?;
@@ -1861,13 +1854,21 @@ impl AuthService for DatabaseAuthService {
             .clone()
             .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Invalid token"))?;
         let (session_id, _, _) = self.parse_token_session(&claims)?;
+        // JWT validation allows clock-skew leeway; logout proofs do not.
+        if claims.exp <= Utc::now().timestamp() {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Token expired or revoked",
+            ));
+        }
 
         let pool = self
             .get_pool()
             .await
             .map_err(|e| map_auth_sqlx(e, "auth.get_pool", None))?;
-        let refresh_token_hash = sha256_hex(&request.refresh_token);
-        let _invalidation = self.authentication_cache.mutation();
+        let _invalidation = self
+            .authentication_cache
+            .session_mutation(&user_id, &session_id);
         let mut tx = pool
             .begin()
             .await
@@ -1883,28 +1884,9 @@ impl AuthService for DatabaseAuthService {
                 "Token expired or revoked",
             ));
         }
-        // A consumed token cannot refresh again, but can still terminate the
-        // session it originally owned. The shared user lock serializes this
-        // revocation with refresh's compare-and-revoke and successor insert.
-        let stored = query(
-            "SELECT user_id, DATE_FORMAT(expires_at, '%Y-%m-%dT%H:%i:%s') AS expires_at, session_id \
-             FROM auth_refresh_tokens WHERE token_hash = ? LIMIT 1",
-        )
-        .bind(&refresh_token_hash)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| map_auth_sqlx(e, "logout.fetch_refresh_token", Some(&pool)))?
-        .map(|row| decode_refresh_token_row(&row))
-        .transpose()
-        .map_err(|e| map_auth_sqlx(e, "logout.decode_refresh_token", Some(&pool)))?
-        .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Token expired or revoked"))?;
-        if stored.0 != user_id || stored.2.as_deref() != Some(session_id.as_str()) {
-            return Err(error_response(
-                StatusCode::UNAUTHORIZED,
-                "Token session mismatch",
-            ));
-        }
-        if stored.1 < Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string() {
+        // Recheck after waiting for the lock. The signed session claim is the
+        // proof even when a consumed token's old hash has been replaced.
+        if claims.exp <= Utc::now().timestamp() {
             return Err(error_response(
                 StatusCode::UNAUTHORIZED,
                 "Token expired or revoked",

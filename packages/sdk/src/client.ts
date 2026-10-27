@@ -622,18 +622,32 @@ export function chatRequestToWire(req: ChatRequest): Record<string, unknown> {
  * same layout as `astra-thin-client` / `astra-server`; set `pathPrefix` when a
  * gateway mounts the API under a prefix.
  */
+type RefreshAttempt = {
+  phase: "refreshing" | "notifying" | "done";
+  result: boolean;
+  waiters: Set<(result: boolean) => void>;
+};
+
+type TokenRevision = {
+  accessToken: string | null;
+  refreshToken: string | null;
+  notification: "pending" | "succeeded" | "failed";
+  attempt: RefreshAttempt | null;
+};
+
+function tokenRevision(accessToken: string | null, refreshToken: string | null): TokenRevision {
+  return { accessToken, refreshToken, notification: "succeeded", attempt: null };
+}
+
 export class AstraClient {
   private config: AstraClientConfig;
-  private accessToken: string | null;
-  private refreshTokenValue: string | null;
+  private tokens: TokenRevision;
   private authGeneration = 0;
   private authAttempt: object | null = null;
-  private refreshAttempt: { generation: number; waiters: Set<(result: boolean) => void> } | null = null;
 
   constructor(config: AstraClientConfig) {
     this.config = config;
-    this.accessToken = config.accessToken ?? null;
-    this.refreshTokenValue = config.refreshToken ?? null;
+    this.tokens = tokenRevision(config.accessToken ?? null, config.refreshToken ?? null);
   }
 
   private apiPath(path: string): string {
@@ -689,9 +703,8 @@ export class AstraClient {
   async logout(): Promise<void> {
     this.authGeneration++;
     this.authAttempt = null;
-    const refreshToken = this.refreshTokenValue;
-    this.accessToken = null;
-    this.refreshTokenValue = null;
+    const refreshToken = this.tokens.refreshToken;
+    this.tokens = tokenRevision(null, null);
     if (refreshToken) {
       await this.request(PATH_AUTH_LOGOUT, {
         method: "POST",
@@ -761,35 +774,52 @@ export class AstraClient {
   setTokens(accessToken: string, refreshToken?: string): void {
     this.authGeneration++;
     this.authAttempt = null;
-    this.accessToken = accessToken;
-    this.refreshTokenValue = refreshToken || null;
+    this.tokens = tokenRevision(accessToken, refreshToken || null);
   }
 
   /** A detached snapshot of the credentials currently owned by this client. */
   getTokens(): Readonly<{ accessToken: string | null; refreshToken: string | null }> {
-    return { accessToken: this.accessToken, refreshToken: this.refreshTokenValue };
+    return { accessToken: this.tokens.accessToken, refreshToken: this.tokens.refreshToken };
   }
 
-  private tryRefreshToken(generation: number, rejectedToken: string | null, signal?: AbortSignal | null): Promise<boolean> {
+  private tryRefreshToken(generation: number, revision: TokenRevision, signal?: AbortSignal | null): Promise<boolean> {
     if (signal?.aborted) return Promise.reject(signal.reason);
     if (generation !== this.authGeneration) return Promise.resolve(false);
-    let attempt = this.refreshAttempt;
-    if (attempt?.generation !== generation) {
-      // A delayed 401 may belong to a token another request already rotated.
-      if (rejectedToken !== this.accessToken) return Promise.resolve(true);
-      if (!this.refreshTokenValue) return Promise.resolve(false);
-      attempt = { generation, waiters: new Set() };
-      this.refreshAttempt = attempt;
+    // Do not overlap notifications: an older async persistence callback could
+    // otherwise overwrite the successor refresh token after rotation.
+    if (this.tokens.notification === "pending") return Promise.resolve(false);
+    let attempt = revision.attempt;
+    if (attempt?.phase === "notifying") return Promise.resolve(false);
+    if (attempt?.phase === "done") {
+      const newerAttempt = this.tokens.attempt;
+      if (newerAttempt?.phase === "refreshing") {
+        // Join the newer rotation instead of retrying a token that another
+        // request has already rejected.
+        attempt = newerAttempt;
+      } else {
+        return Promise.resolve(
+          (attempt.result || revision !== this.tokens) && this.tokens.notification === "succeeded",
+        );
+      }
+    }
+    if (!attempt) {
+      if (revision !== this.tokens || !revision.refreshToken) return Promise.resolve(false);
+      attempt = { phase: "refreshing", result: false, waiters: new Set() };
+      revision.attempt = attempt;
       const current = attempt;
-      // Observe the operation once; cancelled waiters can be removed even if it hangs.
-      void this.refreshTokens(generation, this.refreshTokenValue).then(
+      const finish = (result: boolean) => {
+        current.phase = "done";
+        current.result = result;
+        // Failed network/HTTP refreshes may be tried again later.
+        if (revision === this.tokens) revision.attempt = null;
+        for (const settle of current.waiters) settle(result);
+      };
+      void this.refreshTokens(generation, revision, current).then(
         result => {
-          if (this.refreshAttempt === current) this.refreshAttempt = null;
-          for (const settle of current.waiters) settle(result);
+          finish(result);
         },
         () => {
-          if (this.refreshAttempt === current) this.refreshAttempt = null;
-          for (const settle of current.waiters) settle(false);
+          finish(false);
         },
       );
     }
@@ -807,12 +837,12 @@ export class AstraClient {
     });
   }
 
-  private async refreshTokens(generation: number, refreshToken: string): Promise<boolean> {
+  private async refreshTokens(generation: number, revision: TokenRevision, attempt: RefreshAttempt): Promise<boolean> {
     try {
       const res = await fetch(this.apiPath(PATH_AUTH_REFRESH), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ refresh_token: refreshToken }),
+        body: JSON.stringify({ refresh_token: revision.refreshToken }),
         cache: "no-store",
       });
       if (!res.ok) return false;
@@ -823,15 +853,20 @@ export class AstraClient {
         typeof data.access_token !== "string" ||
         typeof data.refresh_token !== "string"
       ) return false;
-      this.accessToken = data.access_token;
-      this.refreshTokenValue = data.refresh_token;
-      // Notification may reenter the client and need another refresh.
-      this.refreshAttempt = null;
-      await this.config.onTokenRefresh?.({
-        accessToken: data.access_token,
-        refreshToken: data.refresh_token,
-      });
-      return generation === this.authGeneration;
+      const next = tokenRevision(data.access_token, data.refresh_token);
+      this.tokens = next;
+      if (this.config.onTokenRefresh) {
+        next.notification = "pending";
+        attempt.phase = "notifying";
+        try {
+          await this.config.onTokenRefresh({ accessToken: data.access_token, refreshToken: data.refresh_token });
+          next.notification = "succeeded";
+        } catch {
+          next.notification = "failed";
+          return false;
+        }
+      }
+      return generation === this.authGeneration && this.tokens.notification === "succeeded";
     } catch {
       return false;
     }
@@ -840,7 +875,7 @@ export class AstraClient {
   private buildHeaders(auth: "optional" | "none"): Record<string, string> {
     const headers = new Headers(headersInitToRecord(this.config.headers ?? {}));
     if (auth === "none") headers.delete("Authorization");
-    else if (this.accessToken) headers.set("Authorization", `Bearer ${this.accessToken}`);
+    else if (this.tokens.accessToken) headers.set("Authorization", `Bearer ${this.tokens.accessToken}`);
     return headersInitToRecord({}, headers);
   }
 
@@ -861,9 +896,11 @@ export class AstraClient {
     const auth = options?.auth ?? "optional";
     const url = this.apiPath(path);
     const generation = this.authGeneration;
-    const accessToken = this.accessToken;
+    const revision = this.tokens;
+    const accessToken = revision.accessToken;
     const requestHeaders = headersInitToRecord({}, init?.headers);
-    const explicitAuthorization = new Headers(requestHeaders).has("Authorization");
+    const explicitAuthorization = new Headers(requestHeaders).has("Authorization")
+      || (!accessToken && new Headers(headersInitToRecord(this.config.headers ?? {})).has("Authorization"));
     const method = (init?.method ?? "GET").toUpperCase();
     const replayable = !(typeof ReadableStream !== "undefined" && init?.body instanceof ReadableStream);
     const mayRetry = options?.retryUnauthorized ?? (method === "GET" || method === "HEAD");
@@ -872,10 +909,10 @@ export class AstraClient {
       headers: headersInitToRecord(this.buildHeaders(auth), requestHeaders),
     });
     let res = await send();
-    if (res.status === 401 && auth !== "none" && accessToken && !explicitAuthorization && mayRetry && replayable && !init?.signal?.aborted) {
-      const refreshed = await this.tryRefreshToken(generation, accessToken, init?.signal);
+    if (res.status === 401 && auth !== "none" && (accessToken || revision.refreshToken) && !explicitAuthorization && mayRetry && replayable && !init?.signal?.aborted) {
+      const refreshed = await this.tryRefreshToken(generation, revision, init?.signal);
       if (init?.signal?.aborted) throw init.signal.reason;
-      if (refreshed && generation === this.authGeneration) res = await send();
+      if (refreshed && generation === this.authGeneration && this.tokens.notification === "succeeded") res = await send();
     }
     return res;
   }

@@ -46,18 +46,83 @@ it("persists refreshed httpOnly cookies before the initiating SDK request comple
   await expect(pending).resolves.toEqual({ user_id: "alice" });
   const options = { httpOnly: true, sameSite: "lax", path: "/" };
   expect(set.mock.calls).toEqual([
-    [ACCESS_TOKEN_COOKIE, "new-access", options],
     [REFRESH_TOKEN_COOKIE, "new-refresh", options],
+    [ACCESS_TOKEN_COOKIE, "new-access", options],
   ]);
   expect(fetchMock.mock.calls.map(([, init]) => new Headers(init?.headers).get("Authorization"))).toEqual([
     "Bearer old-access", null, "Bearer new-access", "Bearer new-access",
   ]);
 });
 
+it("does not replay a delayed old-token request while cookie persistence fails", async () => {
+  let release401!: (response: Response) => void;
+  let releaseCookies!: () => void;
+  const late401 = new Promise<Response>(resolve => { release401 = resolve; });
+  const cookiesReady = new Promise<void>(resolve => { releaseCookies = resolve; });
+  vi.mocked(cookies).mockImplementation(async () => {
+    await cookiesReady;
+    return { set: () => { throw new Error("cookie write unavailable"); } } as unknown as Awaited<ReturnType<typeof cookies>>;
+  });
+  const expired = () => new Response("expired", { status: 401 });
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    if (url.endsWith('/auth/refresh')) return Response.json({ access_token: 'new', refresh_token: 'rotated' });
+    const auth = new Headers(init?.headers).get('Authorization');
+    if (url.endsWith('/late') && auth === 'Bearer old') return late401;
+    return auth === 'Bearer old' ? expired() : new Response('ok');
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  const runtime = new WebRuntimeClient(runtimeConfig('old', 'old-refresh'));
+  const late = runtime.fetchResponse('/late', { auth: 'required' });
+  const first = runtime.fetchResponse('/first', { auth: 'required' });
+  await vi.waitFor(() => expect(cookies).toHaveBeenCalledTimes(1));
+  release401(expired());
+  expect((await late).status).toBe(401);
+  releaseCookies();
+  expect((await first).status).toBe(401);
+  expect(fetchMock.mock.calls.filter(([url]) => url.endsWith('/late'))).toHaveLength(1);
+  expect(fetchMock.mock.calls.filter(([url]) => url.endsWith('/first'))).toHaveLength(1);
+});
+
+it("can recover when writing the access cookie fails after the rotated refresh cookie", async () => {
+  const jar = new Map([[ACCESS_TOKEN_COOKIE, 'old'], [REFRESH_TOKEN_COOKIE, 'old-refresh']]);
+  let failAccess = true;
+  vi.mocked(cookies).mockResolvedValue({
+    set(name: string, value: string) {
+      if (name === ACCESS_TOKEN_COOKIE && failAccess) {
+        failAccess = false;
+        throw new Error('access cookie write failed');
+      }
+      jar.set(name, value);
+    },
+  } as unknown as Awaited<ReturnType<typeof cookies>>);
+  let validRefresh = 'old-refresh';
+  let rotations = 0;
+  const seenRefresh: string[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (url.endsWith('/auth/refresh')) {
+      const refresh = JSON.parse(String(init?.body)).refresh_token;
+      seenRefresh.push(refresh);
+      if (refresh !== validRefresh) return new Response('expired', { status: 401 });
+      rotations++;
+      validRefresh = `refresh-${rotations}`;
+      return Response.json({ access_token: `access-${rotations}`, refresh_token: validRefresh });
+    }
+    return new Headers(init?.headers).get('Authorization') === `Bearer access-${rotations}`
+      ? Response.json({ user_id: 'alice' }) : new Response('expired', { status: 401 });
+  }));
+  const first = new WebRuntimeClient(runtimeConfig('old', 'old-refresh'));
+  expect((await first.fetchResponse('/resource', { auth: 'required' })).status).toBe(401);
+  expect(jar.get(ACCESS_TOKEN_COOKIE)).toBe('old');
+  expect(jar.get(REFRESH_TOKEN_COOKIE)).toBe('refresh-1');
+  const retry = new WebRuntimeClient(runtimeConfig(jar.get(ACCESS_TOKEN_COOKIE)!, jar.get(REFRESH_TOKEN_COOKIE)!));
+  await expect(retry.get('/resource', { auth: 'required' })).resolves.toEqual({ user_id: 'alice' });
+  expect(seenRefresh).toEqual(['old-refresh', 'refresh-1']);
+});
+
 it.each([
   { name: "SDK notification", sdkRefresh: true },
   { name: "Web transport", sdkRefresh: false },
-])("keeps the newest usable cookies when the $name refresh finishes before an older notification", async ({ sdkRefresh }) => {
+])("does not rotate during an outstanding $name notification and recovers afterward", async ({ sdkRefresh }) => {
   let release!: () => void;
   const available = new Promise<void>(resolve => { release = resolve; });
   const jar = new Map<string, string>();
@@ -94,20 +159,19 @@ it.each([
   await vi.waitFor(() => expect(cookies).toHaveBeenCalledTimes(1));
   expired.add("access-1");
   if (sdkRefresh) {
-    await expect(runtime.sdk.getMe()).resolves.toEqual({ user_id: "alice" });
+    await expect(runtime.sdk.getMe()).rejects.toMatchObject({ status: 401 });
   } else {
-    await expect(runtime.get("/auth/me", { auth: "required" })).resolves.toEqual({ user_id: "alice" });
+    await expect(runtime.get("/auth/me", { auth: "required" })).rejects.toMatchObject({ status: 401 });
   }
   release();
-  expect(await first).toMatchObject([{ status: "fulfilled", value: { user_id: "alice" } }]);
+  expect(await first).toMatchObject([{ status: "rejected", reason: { status: 401 } }]);
 
-  const committed = set.mock.calls.map(([name, value]) => [name, value]);
+  expect(set.mock.calls.map(([name, value]) => [name, value])).toEqual([
+    [REFRESH_TOKEN_COOKIE, "refresh-1"],
+    [ACCESS_TOKEN_COOKIE, "access-1"],
+  ]);
   const next = new WebRuntimeClient(runtimeConfig(jar.get(ACCESS_TOKEN_COOKIE)!, jar.get(REFRESH_TOKEN_COOKIE)!));
   await expect(next.sdk.getMe()).resolves.toEqual({ user_id: "alice" });
-  expect(committed).toEqual([
-    [ACCESS_TOKEN_COOKIE, "access-2"],
-    [REFRESH_TOKEN_COOKIE, "refresh-2"],
-  ]);
   expect(jar.get(REFRESH_TOKEN_COOKIE)).toBe(validRefresh);
   expect(refreshRequests).toEqual(["refresh-0", "refresh-1"]);
 });

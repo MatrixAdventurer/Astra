@@ -171,9 +171,20 @@ overwrite a newer authentication decision.
 This coordination is per client instance, not across separate BFF requests.
 
 `onTokenRefresh` may be asynchronous and call the same client. Requests already
-awaiting its rotation still wait for the callback. Callback failure preserves
-the rotated credentials and returns those callers' original authentication
-error. Notifications from successive rotations may overlap.
+awaiting its rotation still wait for the callback, so the callback must not
+await a request that has already joined that rotation. A delayed old-token 401
+returns its original error while that notification is pending or has failed
+without a recovery in progress, so it cannot use credentials whose persistence
+is uncertain. Callback failure
+preserves the rotated credentials in memory. Requests made during notification
+can use the current token, but a 401 does not start another refresh until the
+notification finishes. This prevents overlapping persistence callbacks from
+storing a superseded refresh token. A delayed 401 joins a newer in-flight
+rotation when no notification is active.
+If credentials can be replaced while a callback writes to external storage,
+that storage must use an atomic conditional write or another ordering mechanism
+to prevent an older callback from overwriting newer credentials. Checking
+`getTokens()` before an asynchronous write alone is not sufficient.
 The Web runtime client persists a captured pair only if it still matches that
 instance's current credentials after asynchronous cookie acquisition.
 
