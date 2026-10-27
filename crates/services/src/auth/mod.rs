@@ -1867,12 +1867,37 @@ impl AuthService for DatabaseAuthService {
             .await
             .map_err(|e| map_auth_sqlx(e, "auth.get_pool", None))?;
         let refresh_token_hash = sha256_hex(&request.refresh_token);
-        let stored = self
-            .fetch_refresh_token(&pool, &refresh_token_hash)
+        let _invalidation = self.authentication_cache.mutation();
+        let mut tx = pool
+            .begin()
             .await
-            .map_err(|e| map_auth_sqlx(e, "logout.fetch_refresh_token", Some(&pool)))?
-            .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Token expired or revoked"))?;
-
+            .map_err(|e| map_auth_sqlx(e, "logout.begin_tx", Some(&pool)))?;
+        let account = query("SELECT user_id FROM auth_users WHERE user_id = ? FOR UPDATE")
+            .bind(&user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| map_auth_sqlx(e, "logout.lock_user", Some(&pool)))?;
+        if account.is_none() {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Token expired or revoked",
+            ));
+        }
+        // A consumed token cannot refresh again, but can still terminate the
+        // session it originally owned. The shared user lock serializes this
+        // revocation with refresh's compare-and-revoke and successor insert.
+        let stored = query(
+            "SELECT user_id, DATE_FORMAT(expires_at, '%Y-%m-%dT%H:%i:%s') AS expires_at, session_id \
+             FROM auth_refresh_tokens WHERE token_hash = ? LIMIT 1",
+        )
+        .bind(&refresh_token_hash)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| map_auth_sqlx(e, "logout.fetch_refresh_token", Some(&pool)))?
+        .map(|row| decode_refresh_token_row(&row))
+        .transpose()
+        .map_err(|e| map_auth_sqlx(e, "logout.decode_refresh_token", Some(&pool)))?
+        .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Token expired or revoked"))?;
         if stored.0 != user_id || stored.2.as_deref() != Some(session_id.as_str()) {
             return Err(error_response(
                 StatusCode::UNAUTHORIZED,
@@ -1885,18 +1910,12 @@ impl AuthService for DatabaseAuthService {
                 "Token expired or revoked",
             ));
         }
-
-        let _invalidation = self.authentication_cache.mutation();
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|e| map_auth_sqlx(e, "logout.begin_tx", Some(&pool)))?;
-        query("UPDATE auth_refresh_tokens SET is_revoked = 1 WHERE token_hash = ? AND user_id = ?")
-            .bind(&refresh_token_hash)
+        query("UPDATE auth_refresh_tokens SET is_revoked = 1 WHERE user_id = ? AND session_id = ? AND is_revoked = 0")
             .bind(&user_id)
+            .bind(&session_id)
             .execute(&mut *tx)
             .await
-            .map_err(|e| map_auth_sqlx(e, "logout.revoke_submitted_token", Some(&pool)))?;
+            .map_err(|e| map_auth_sqlx(e, "logout.revoke_session", Some(&pool)))?;
 
         tx.commit()
             .await

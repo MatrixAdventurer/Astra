@@ -19,6 +19,7 @@ export type RuntimeAuthMode = "required" | "optional" | "none";
 
 export type RuntimeRequestInit = Omit<RequestInit, "body"> & {
   auth?: RuntimeAuthMode;
+  retryUnauthorized?: boolean;
   json?: unknown;
   operation?: string;
   body?: BodyInit | null;
@@ -79,7 +80,7 @@ export class WebRuntimeClient {
   }
 
   async request<T>(path: string, init: RuntimeRequestInit = {}): Promise<T> {
-    const response = await this.fetchResponse(path, init);
+    const response = await this.fetchResponse(path, { ...init, retryUnauthorized: init.retryUnauthorized ?? true });
     if (!response.ok) {
       throw new RuntimeClientError({
         operation: init.operation ?? `${init.method ?? "GET"} ${path}`,
@@ -120,7 +121,7 @@ export class WebRuntimeClient {
     return this.sdk.fetchResponse(
       path,
       this.toRequestInit(init, auth, operation, path),
-      { auth: auth === "none" ? "none" : "optional" },
+      { auth: auth === "none" ? "none" : "optional", retryUnauthorized: init.retryUnauthorized },
     );
   }
 
@@ -150,7 +151,7 @@ export class WebRuntimeClient {
       });
     }
 
-    const { auth: _auth, json: _json, operation: _operation, ...rest } = init;
+    const { auth: _auth, json: _json, operation: _operation, retryUnauthorized: _retryUnauthorized, ...rest } = init;
     return {
       ...rest,
       method,

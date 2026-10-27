@@ -200,3 +200,20 @@ it("does not authenticate or refresh anonymous Web calls and preserves explicit 
   expect(new Headers(fetchMock.mock.calls[1][1]?.headers).get("Authorization")).toBe("Bearer explicit");
   expect(new Headers(fetchMock.mock.calls[1][1]?.headers).get("X-User-Id")).toBe("hint");
 });
+
+it("only retries a raw mutation when its caller opts in", async () => {
+  vi.mocked(cookies).mockResolvedValue({ set: vi.fn() } as unknown as Awaited<ReturnType<typeof cookies>>);
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    if (url.endsWith('/auth/refresh')) return Response.json({ access_token: 'new', refresh_token: 'rotated' });
+    return new Headers(init?.headers).get('Authorization') === 'Bearer new'
+      ? new Response('ok') : new Response('expired', { status: 401 });
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  const runtime = new WebRuntimeClient(runtimeConfig('old', 'refresh'));
+  expect((await runtime.fetchResponse('/write', { method: 'POST', json: { value: 1 } })).status).toBe(401);
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  await expect(runtime.post('/write', { value: 1 }, { retryUnauthorized: false })).rejects.toMatchObject({ status: 401 });
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+  expect((await runtime.fetchResponse('/write', { method: 'POST', json: { value: 1 }, retryUnauthorized: true })).status).toBe(200);
+  expect(fetchMock).toHaveBeenCalledTimes(5);
+});

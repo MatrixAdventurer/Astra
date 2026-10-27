@@ -67,6 +67,11 @@ unrelated principal. Absolute token, observed Session and Memoria access expiry
 are checked again after awaited validation. A request starting after a local
 logout cannot reuse an invalidated observation.
 
+Refresh and logout serialize on the account lock. Logout validates the
+recorded token and revokes its entire session, so a concurrent rotation
+cannot leave a usable successor. A previously consumed, unexpired token may
+terminate its own session but never regain refresh authority.
+
 This cache observes identity, not operation permissions. Memory operations
 continue resolving scoped credentials through the canonical credential resolver;
 provider-request replay checks, sensitive reauthentication and execution-handoff

@@ -161,10 +161,13 @@ already accepted frame to other subscribed callbacks.
 
 ### Browser apps and the BFF pattern
 
-Within one `AstraClient`, concurrent REST and buffered run-event requests share
+Within one `AstraClient`, concurrent REST, live streams and buffered run-event requests share
 one token refresh. A delayed 401 reuses the rotated token. Refresh responses
 started before `setTokens`, successful login/registration, or logout cannot
 restore the previous credentials or retry an old request under a new account.
+`setTokens(accessToken)` clears any previous refresh token; pass both tokens
+when replacing a credential pair. Pending login and logout operations cannot
+overwrite a newer authentication decision.
 This coordination is per client instance, not across separate BFF requests.
 
 `onTokenRefresh` may be asynchronous and call the same client. Requests already
@@ -183,7 +186,11 @@ error; initial transport errors still propagate.
 `fetchResponse(path, init, { auth })` returns an unconsumed response, including
 non-2xx responses, without inferring a JSON content type. Its default auth is
 `"optional"`; `"none"` suppresses default authorization and automatic refresh.
-Explicit request headers still override defaults. `getTokens()` returns a
+Explicit request headers still override defaults and are not automatically
+refreshed using the client's credentials. Raw mutation requests are not retried
+unless `retryUnauthorized` is explicitly enabled for an endpoint that rejects
+authentication before admitting the operation. Streams and one-shot bodies
+are never replayed after acceptance. `getTokens()` returns a
 detached snapshot of current credentials, not the initial configuration.
 Bodies must remain replayable for the single automatic retry.
 

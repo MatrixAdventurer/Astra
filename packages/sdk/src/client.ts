@@ -627,6 +627,7 @@ export class AstraClient {
   private accessToken: string | null;
   private refreshTokenValue: string | null;
   private authGeneration = 0;
+  private authAttempt: object | null = null;
   private refreshAttempt: { generation: number; promise: Promise<boolean> } | null = null;
 
   constructor(config: AstraClientConfig) {
@@ -654,34 +655,48 @@ export class AstraClient {
     const email = options?.email ?? `${username}@users.local.astra`;
     const body: Record<string, unknown> = { username, email, password };
     if (options?.displayName) body.display_name = options.displayName;
-    const result = await this.post<AuthResult>(PATH_AUTH_REGISTER, body);
-    this.setTokens(result.access_token, result.refresh_token);
-    return result;
+    return this.authenticate(PATH_AUTH_REGISTER, body);
   }
 
   /** Log in with username/password. Stores tokens automatically. */
   async login(username: string, password: string): Promise<AuthResult> {
-    const result = await this.post<AuthResult>(PATH_AUTH_LOGIN, {
+    return this.authenticate(PATH_AUTH_LOGIN, {
       username,
       password,
     });
-    this.setTokens(result.access_token, result.refresh_token);
-    return result;
+  }
+
+  private async authenticate(path: string, body: unknown): Promise<AuthResult> {
+    const attempt = {};
+    this.authAttempt = attempt;
+    try {
+      const response = await this.request(path, {
+        method: "POST",
+        body: JSON.stringify(body),
+      }, { auth: "none" });
+      const result = await response.json() as AuthResult;
+      if (this.authAttempt !== attempt) {
+        throw new Error("Authentication attempt was superseded");
+      }
+      this.setTokens(result.access_token, result.refresh_token);
+      return result;
+    } finally {
+      if (this.authAttempt === attempt) this.authAttempt = null;
+    }
   }
 
   /** Log out and clear stored tokens. Requires refresh token in client state. */
   async logout(): Promise<void> {
     this.authGeneration++;
-    try {
-      if (this.refreshTokenValue) {
-        await this.post(PATH_AUTH_LOGOUT, {
-          refresh_token: this.refreshTokenValue,
-        });
-      }
-    } finally {
-      this.authGeneration++;
-      this.accessToken = null;
-      this.refreshTokenValue = null;
+    this.authAttempt = null;
+    const refreshToken = this.refreshTokenValue;
+    this.accessToken = null;
+    this.refreshTokenValue = null;
+    if (refreshToken) {
+      await this.request(PATH_AUTH_LOGOUT, {
+        method: "POST",
+        body: JSON.stringify({ refresh_token: refreshToken }),
+      }, { auth: "none" });
     }
   }
 
@@ -745,8 +760,9 @@ export class AstraClient {
 
   setTokens(accessToken: string, refreshToken?: string): void {
     this.authGeneration++;
+    this.authAttempt = null;
     this.accessToken = accessToken;
-    if (refreshToken) this.refreshTokenValue = refreshToken;
+    this.refreshTokenValue = refreshToken || null;
   }
 
   /** A detached snapshot of the credentials currently owned by this client. */
@@ -810,37 +826,49 @@ export class AstraClient {
     return headersInitToRecord({}, headers);
   }
 
+  private streamHeaders(extra?: Record<string, string>): Record<string, string> {
+    const headers = new Headers(headersInitToRecord(this.config.headers ?? {}));
+    headers.delete("Authorization");
+    return headersInitToRecord(headersInitToRecord({}, headers), extra);
+  }
+
   // ─── HTTP helpers ──────────────────────────────────────────────────
 
   /** Raw, body-neutral transport; returns the final response without consuming it. */
   async fetchResponse(
     path: string,
     init?: RequestInit,
-    options?: { auth?: "optional" | "none" },
+    options?: { auth?: "optional" | "none"; retryUnauthorized?: boolean },
   ): Promise<Response> {
     const auth = options?.auth ?? "optional";
     const url = this.apiPath(path);
     const generation = this.authGeneration;
     const accessToken = this.accessToken;
+    const requestHeaders = headersInitToRecord({}, init?.headers);
+    const explicitAuthorization = new Headers(requestHeaders).has("Authorization");
+    const method = (init?.method ?? "GET").toUpperCase();
+    const replayable = !(typeof ReadableStream !== "undefined" && init?.body instanceof ReadableStream);
+    const mayRetry = options?.retryUnauthorized ?? (method === "GET" || method === "HEAD");
     const send = () => fetch(url, {
       ...init,
-      headers: headersInitToRecord(this.buildHeaders(auth), init?.headers),
+      headers: headersInitToRecord(this.buildHeaders(auth), requestHeaders),
     });
     let res = await send();
-    if (res.status === 401 && auth !== "none") {
+    if (res.status === 401 && auth !== "none" && accessToken && !explicitAuthorization && mayRetry && replayable && !init?.signal?.aborted) {
       const refreshed = await this.tryRefreshToken(generation, accessToken);
+      if (init?.signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
       if (refreshed && generation === this.authGeneration) res = await send();
     }
     return res;
   }
 
-  private async request(path: string, init?: RequestInit): Promise<Response> {
+  private async request(path: string, init?: RequestInit, options?: { auth?: "optional" | "none" }): Promise<Response> {
     const method = (init?.method ?? "GET").toUpperCase();
     const json = init?.body != null && ["POST", "PUT", "PATCH", "DELETE"].includes(method);
     const res = await this.fetchResponse(path, {
       ...init,
       headers: headersInitToRecord(json ? { "Content-Type": "application/json" } : {}, init?.headers),
-    });
+    }, { ...options, retryUnauthorized: true });
 
     if (!res.ok) {
       const error = await readAstraError(res);
@@ -2697,6 +2725,7 @@ export class AstraClient {
       );
     }
     const url = this.apiPath(workBranchTurnsPath(workId, branchId));
+    const generation = this.authGeneration;
     let client: SSEClient;
     client = new SSEClient({
       url,
@@ -2706,11 +2735,13 @@ export class AstraClient {
         attachment_id: input.attachmentId,
         message: input.message,
       }),
-      token: this.accessToken ?? undefined,
-      headers: {
-        ...this.config.headers,
-        [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR,
+      transport: (_url, init) => {
+        if (generation !== this.authGeneration) throw new Error("Authentication changed before stream connection");
+        return this.fetchResponse(workBranchTurnsPath(workId, branchId), init, { retryUnauthorized: true });
       },
+      headers: this.streamHeaders({
+        [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR,
+      }),
       onEvent: (event) => {
         try {
           callbacks.onEvent(decodeWorkTurnStreamEventV1(event));
@@ -3412,12 +3443,16 @@ export class AstraClient {
     },
   ): SSEClient {
     const url = this.apiPath(PATH_CHAT_STREAM);
+    const generation = this.authGeneration;
     const client = new SSEClient({
       url,
       method: "POST",
       body: JSON.stringify(chatRequestToWire(request)),
-      token: this.accessToken ?? undefined,
-      headers: this.config.headers,
+      transport: (_url, init) => {
+        if (generation !== this.authGeneration) throw new Error("Authentication changed before stream connection");
+        return this.fetchResponse(PATH_CHAT_STREAM, init, { retryUnauthorized: true });
+      },
+      headers: this.streamHeaders(),
       onEvent: callbacks.onEvent,
       onStateChange: callbacks.onStateChange,
       onRawLine: callbacks.onRawLine,
