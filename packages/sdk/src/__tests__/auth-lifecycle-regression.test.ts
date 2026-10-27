@@ -131,6 +131,66 @@ test.each(['chat', 'work'] as const)('%s stream and REST share refresh without r
   expect(fetch.mock.calls.filter(([url]) => url.includes(kind === 'chat' ? '/chat/stream' : '/turns'))).toHaveLength(2);
 });
 
+test('an aborted refresh waiter settles while other callers keep sharing the refresh', async () => {
+  const refresh = deferred<Response>();
+  const fetch = vi.fn(async (url: string, init?: RequestInit) => {
+    if (url.endsWith('/auth/refresh')) return refresh.promise;
+    return bearer(init) === 'Bearer new-access' ? new Response('ok') : unauthorized();
+  });
+  vi.stubGlobal('fetch', fetch);
+  const client = new AstraClient({ baseUrl: 'https://example.test', accessToken: 'old', refreshToken: 'old-refresh' });
+  const controller = new AbortController();
+  const aborted = client.fetchResponse('/cancelled', { signal: controller.signal });
+  const other = client.fetchResponse('/other');
+  await vi.waitFor(() => expect(fetch.mock.calls.filter(([url]) => url.endsWith('/auth/refresh'))).toHaveLength(1));
+  controller.abort();
+  // This must settle without releasing the pending shared refresh.
+  await expect(aborted).rejects.toMatchObject({ name: 'AbortError' });
+  expect(fetch.mock.calls.filter(([url]) => url.endsWith('/cancelled'))).toHaveLength(1);
+  refresh.resolve(Response.json(tokens));
+  expect((await other).status).toBe(200);
+  expect(fetch.mock.calls.filter(([url]) => url.endsWith('/auth/refresh'))).toHaveLength(1);
+});
+
+test('an abort between refresh completion and replay preserves the caller reason', async () => {
+  const controller = new AbortController();
+  const reason = new Error('caller stopped');
+  const fetch = vi.fn(async (url: string, init?: RequestInit) => {
+    if (url.endsWith('/auth/refresh')) return Response.json(tokens);
+    if (bearer(init) === 'Bearer new-access') {
+      if (url.endsWith('/first')) controller.abort(reason);
+      return new Response('ok');
+    }
+    return unauthorized();
+  });
+  vi.stubGlobal('fetch', fetch);
+  const client = new AstraClient({ baseUrl: 'https://example.test', accessToken: 'old', refreshToken: 'old-refresh' });
+  const first = client.fetchResponse('/first');
+  const second = client.fetchResponse('/second', { signal: controller.signal });
+  await expect(first).resolves.toMatchObject({ status: 200 });
+  await expect(second).rejects.toBe(reason);
+  expect(fetch.mock.calls.filter(([url]) => url.endsWith('/second'))).toHaveLength(1);
+});
+
+test('aborted waiters release their registrations even when refresh never settles', async () => {
+  const refresh = deferred<Response>();
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => url.endsWith('/auth/refresh') ? refresh.promise : unauthorized()));
+  const client = new AstraClient({ baseUrl: 'https://example.test', accessToken: 'old', refreshToken: 'old-refresh' });
+  const reason = new Error('caller stopped');
+  for (let i = 0; i < 20; i++) {
+    const controller = new AbortController();
+    const removed = vi.spyOn(controller.signal, 'removeEventListener');
+    const request = client.fetchResponse('/resource', { signal: controller.signal });
+    await vi.waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalledTimes(i + 2));
+    controller.abort(reason);
+    await expect(request).rejects.toBe(reason);
+    expect(removed).toHaveBeenCalledWith('abort', expect.any(Function));
+  }
+  const attempt = (client as unknown as { refreshAttempt: { waiters: Set<unknown> } }).refreshAttempt;
+  expect(attempt.waiters.size).toBe(0);
+  refresh.resolve(Response.json(tokens));
+});
+
 test('closing a stream while refresh is pending prevents a second POST', async () => {
   const refresh = deferred<Response>();
   const fetch = vi.fn(async (url: string) => url.endsWith('/auth/refresh') ? refresh.promise : unauthorized());

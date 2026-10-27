@@ -6867,7 +6867,7 @@ pub struct CleanupResult {
 
 /// Configuration for expiry policies of authentication and operational data.
 pub struct RetentionPolicy {
-    /// Max age in days for expired/revoked refresh tokens (default: 7)
+    /// Minimum age in days for expired refresh token records (default: 7)
     pub refresh_token_days: u32,
     /// Max age in days for inactive auth tokens (default: 30)
     pub auth_token_days: u32,
@@ -6909,12 +6909,12 @@ pub async fn cleanup_expired_data(
     const AUTH_AUDIT_LOG_BATCH_LIMIT: u32 = 1000;
     let mut results = Vec::new();
 
-    // 1. Expired + revoked refresh tokens
+    // 1. Expired refresh tokens past the minimum retention age
     let deleted = sqlx::query(
         "DELETE FROM auth_refresh_tokens \
-         WHERE (expires_at < NOW(6) OR is_revoked = 1) \
+         WHERE expires_at < NOW(6) \
            AND created_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
-         ORDER BY created_at ASC, token_id ASC \
+         ORDER BY expires_at ASC, token_id ASC \
          LIMIT ?",
     )
     .bind(policy.refresh_token_days)

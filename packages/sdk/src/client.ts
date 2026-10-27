@@ -628,7 +628,7 @@ export class AstraClient {
   private refreshTokenValue: string | null;
   private authGeneration = 0;
   private authAttempt: object | null = null;
-  private refreshAttempt: { generation: number; promise: Promise<boolean> } | null = null;
+  private refreshAttempt: { generation: number; waiters: Set<(result: boolean) => void> } | null = null;
 
   constructor(config: AstraClientConfig) {
     this.config = config;
@@ -770,23 +770,41 @@ export class AstraClient {
     return { accessToken: this.accessToken, refreshToken: this.refreshTokenValue };
   }
 
-  private async tryRefreshToken(generation: number, rejectedToken: string | null): Promise<boolean> {
-    if (generation !== this.authGeneration) return false;
-    if (this.refreshAttempt?.generation === generation) return this.refreshAttempt.promise;
-    // A delayed 401 may belong to a token another request already rotated.
-    if (rejectedToken !== this.accessToken) return true;
-    if (!this.refreshTokenValue) return false;
-    const attempt = {
-      generation,
-      promise: this.refreshTokens(generation, this.refreshTokenValue),
-    };
-    this.refreshAttempt = attempt;
-    try {
-      return await attempt.promise;
-    } finally {
-      // An older account's completion must not clear a newer refresh attempt.
-      if (this.refreshAttempt === attempt) this.refreshAttempt = null;
+  private tryRefreshToken(generation: number, rejectedToken: string | null, signal?: AbortSignal | null): Promise<boolean> {
+    if (signal?.aborted) return Promise.reject(signal.reason);
+    if (generation !== this.authGeneration) return Promise.resolve(false);
+    let attempt = this.refreshAttempt;
+    if (attempt?.generation !== generation) {
+      // A delayed 401 may belong to a token another request already rotated.
+      if (rejectedToken !== this.accessToken) return Promise.resolve(true);
+      if (!this.refreshTokenValue) return Promise.resolve(false);
+      attempt = { generation, waiters: new Set() };
+      this.refreshAttempt = attempt;
+      const current = attempt;
+      // Observe the operation once; cancelled waiters can be removed even if it hangs.
+      void this.refreshTokens(generation, this.refreshTokenValue).then(
+        result => {
+          if (this.refreshAttempt === current) this.refreshAttempt = null;
+          for (const settle of current.waiters) settle(result);
+        },
+        () => {
+          if (this.refreshAttempt === current) this.refreshAttempt = null;
+          for (const settle of current.waiters) settle(false);
+        },
+      );
     }
+    const current = attempt;
+    return new Promise<boolean>((resolve, reject) => {
+      const cleanup = () => {
+        current.waiters.delete(settle);
+        signal?.removeEventListener("abort", abort);
+      };
+      const settle = (result: boolean) => { cleanup(); resolve(result); };
+      const abort = () => { cleanup(); reject(signal?.reason); };
+      current.waiters.add(settle);
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) abort();
+    });
   }
 
   private async refreshTokens(generation: number, refreshToken: string): Promise<boolean> {
@@ -855,8 +873,8 @@ export class AstraClient {
     });
     let res = await send();
     if (res.status === 401 && auth !== "none" && accessToken && !explicitAuthorization && mayRetry && replayable && !init?.signal?.aborted) {
-      const refreshed = await this.tryRefreshToken(generation, accessToken);
-      if (init?.signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+      const refreshed = await this.tryRefreshToken(generation, accessToken, init?.signal);
+      if (init?.signal?.aborted) throw init.signal.reason;
       if (refreshed && generation === this.authGeneration) res = await send();
     }
     return res;

@@ -70,7 +70,9 @@ logout cannot reuse an invalidated observation.
 Refresh and logout serialize on the account lock. Logout validates the
 recorded token and revokes its entire session, so a concurrent rotation
 cannot leave a usable successor. A previously consumed, unexpired token may
-terminate its own session but never regain refresh authority.
+terminate its own session but never regain refresh authority. Refresh-token
+records remain until they are expired and older than the configured minimum
+retention age, so cleanup cannot remove this logout proof early.
 
 This cache observes identity, not operation permissions. Memory operations
 continue resolving scoped credentials through the canonical credential resolver;

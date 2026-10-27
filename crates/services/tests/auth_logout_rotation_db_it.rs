@@ -3,7 +3,7 @@ mod common;
 use astra_core::JwtSettings;
 use astra_services::{
     AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
-    DatabaseAuthService,
+    DatabaseAuthService, RetentionPolicy, cleanup_expired_data,
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 
@@ -46,6 +46,12 @@ async fn logout_revokes_the_session_across_refresh_rotation_without_revoking_oth
         password: password.into(),
     };
     let original = service.login(login()).await.unwrap();
+    // Model a still-valid token issued more than the cleanup retention age ago.
+    sqlx::query("UPDATE auth_refresh_tokens SET created_at = DATE_SUB(NOW(6), INTERVAL 8 DAY) WHERE user_id = ?")
+        .bind(&user.user_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
     let other = service.login(login()).await.unwrap();
     for invalid in [original.access_token.clone(), "invalid.token".to_string()] {
         assert_eq!(
@@ -75,12 +81,46 @@ async fn logout_revokes_the_session_across_refresh_rotation_without_revoking_oth
             .0,
         StatusCode::UNAUTHORIZED
     );
+    // The old token's revoked row may be removed even though its JWT is still valid.
+    let cleanup = cleanup_expired_data(pool.get(), &RetentionPolicy::default())
+        .await
+        .unwrap();
+    assert!(
+        cleanup
+            .iter()
+            .any(|result| result.table == "auth_refresh_tokens")
+    );
+    let retained: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM auth_refresh_tokens WHERE user_id = ? AND is_revoked = 1",
+    )
+    .bind(&user.user_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        retained, 1,
+        "cleanup must retain an unexpired rotated token"
+    );
     service
         .logout(AuthRefreshRequestData {
             refresh_token: original.refresh_token.clone(),
         })
         .await
         .unwrap();
+    // Once the expired record is beyond retention, cleanup must remove it.
+    sqlx::query("UPDATE auth_refresh_tokens SET expires_at = DATE_SUB(NOW(6), INTERVAL 8 DAY) WHERE user_id = ? AND is_revoked = 1 AND created_at < DATE_SUB(NOW(6), INTERVAL 7 DAY)")
+        .bind(&user.user_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    let cleanup = cleanup_expired_data(pool.get(), &RetentionPolicy::default())
+        .await
+        .unwrap();
+    assert!(
+        cleanup
+            .iter()
+            .any(|result| result.table == "auth_refresh_tokens" && result.rows_deleted > 0)
+    );
     assert_eq!(
         service
             .refresh(AuthRefreshRequestData {
