@@ -10,11 +10,111 @@ use astra_text_utils::credential_redaction::{
 use astra_text_utils::str_preview::{shorten_path, truncate_line};
 
 const SECRET: &str = "abcdefghijklmnop";
+const MARKER_PREFIX: &str = "[REDACTED:";
+const TRUNCATION_NOTICE: &str = "\n[truncated]";
+
+fn complete_marker_len(text: &str, at: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if !bytes.get(at..)?.starts_with(MARKER_PREFIX.as_bytes()) {
+        return None;
+    }
+    let mut i = at + MARKER_PREFIX.len();
+    if !bytes.get(i).copied().map_or(false, |b| b.is_ascii_uppercase()) {
+        return None;
+    }
+    i += 1;
+    while bytes
+        .get(i)
+        .copied()
+        .map_or(false, |b| is_marker_label_byte(b))
+    {
+        i += 1;
+    }
+    if bytes.get(i) == Some(&b']') {
+        return Some(i + 1 - at);
+    }
+    if bytes.get(i) != Some(&b':') {
+        return None;
+    }
+    i += 1;
+    i = hex32_field(bytes, i)?;
+    if bytes.get(i) != Some(&b':') {
+        return None;
+    }
+    i += 1;
+    i = hex32_field(bytes, i)?;
+    if bytes.get(i) == Some(&b':') {
+        i += 1;
+        i = hex32_field(bytes, i)?;
+    }
+    if bytes.get(i) == Some(&b']') {
+        Some(i + 1 - at)
+    } else {
+        None
+    }
+}
 
 fn every_marker_is_complete(text: &str) -> bool {
-    text.split("[REDACTED:")
-        .skip(1)
-        .all(|rest| rest.contains(']'))
+    for (at, _) in text.match_indices(MARKER_PREFIX) {
+        if complete_marker_len(text, at).is_none() {
+            return false;
+        }
+    }
+    // In-prefix fragments: a clipped `[REDACTED:` prefix anywhere in the
+    // window, not only at the tail. Fixture text carries `[` only inside
+    // markers, and truncation notices never start with `[R`.
+    let bytes = text.as_bytes();
+    for at in 0..text.len() {
+        if bytes[at] != b'[' {
+            continue;
+        }
+        if complete_marker_len(text, at).is_some() {
+            continue;
+        }
+        for len in 2..=MARKER_PREFIX.len() {
+            if at + len <= text.len() && text[at..].starts_with(&MARKER_PREFIX[..len]) {
+                return false;
+            }
+        }
+    }
+    !text.ends_with('[')
+}
+
+fn hex32_field(bytes: &[u8], i: usize) -> Option<usize> {
+    let Some(limit) = i.checked_add(32) else {
+        return None;
+    };
+    let Some(field) = bytes.get(i..limit) else {
+        return None;
+    };
+    for &b in field {
+        if !is_lower_hex(b) {
+            return None;
+        }
+    }
+    Some(limit)
+}
+
+fn is_lower_hex(b: u8) -> bool {
+    b.is_ascii_digit() || (b >= b'a' && b <= b'f')
+}
+
+fn is_marker_label_byte(b: u8) -> bool {
+    b == b'_' || b.is_ascii_uppercase() || b.is_ascii_digit()
+}
+
+fn marker_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut at = 0;
+    while at < text.len() {
+        if let Some(len) = complete_marker_len(text, at) {
+            spans.push((at, at + len));
+            at += len;
+        } else {
+            at += 1;
+        }
+    }
+    spans
 }
 
 fn redacted_fixture() -> String {
@@ -37,6 +137,25 @@ fn truncation_helpers_never_split_a_marker_for_any_budget() {
             assert!(!output.contains(SECRET), "budget={budget}");
         }
     }
+
+    // Exact expectations at the first marker's boundary budgets instead of
+    // re-deriving them from the oracle under test.
+    let spans = marker_spans(&redacted);
+    assert_eq!(spans.len(), 40, "every fixture marker must parse");
+    let (mstart, mend) = spans[0];
+    assert!(redacted.is_char_boundary(mstart + 1));
+    for budget in [mstart, mstart + 1, mend - 1] {
+        assert_eq!(
+            truncate_redacted_output(redacted.clone(), budget),
+            format!("{}{TRUNCATION_NOTICE}", &redacted[..mstart]),
+            "budget={budget} must fall back to the marker start",
+        );
+    }
+    assert_eq!(
+        truncate_redacted_output(redacted.clone(), mend),
+        format!("{}{TRUNCATION_NOTICE}", &redacted[..mend]),
+        "budget == marker end keeps the whole marker plus notice",
+    );
 }
 
 #[test]
@@ -135,4 +254,38 @@ fn shorten_path_output_respects_budget() {
             "{path} -> {short} > {budget}"
         );
     }
+}
+
+#[test]
+fn marker_oracle_rejects_clipped_marker_fragments() {
+    // Intact marker forms and marker-free notices must pass the scan.
+    for (case, text) in [
+        ("display marker", "[REDACTED:SECRET_ASSIGNMENT]"),
+        ("executor marker", "[REDACTED:C6:8124567890abcdef8124567890abcdef:8124567890abcdef8124567890abcdef]"),
+        ("marker amid text", "x [REDACTED:SECRET_ASSIGNMENT] y"),
+        ("notice only", "\n[truncated]"),
+        ("empty window", ""),
+    ] {
+        assert!(every_marker_is_complete(text), "must accept intact: {case}");
+    }
+    // Clipped markers: each was accepted by the previous
+    // split("[REDACTED:").all(contains(']')) oracle because a later `]`
+    // in the truncation notice closed the fragment.
+    for (case, text) in [
+        ("cut mid nonce", "password=[REDACTED:C6:8124\n[truncated]"),
+        ("cut mid hex field", "password=[REDACTED:C6:8124567890abcdef8124567890abcdef\n[truncated]"),
+        ("executor missing close", "[REDACTED:C6:8124567890abcdef8124567890abcdef:8124567890abcdef8124567890abcdef\n[truncated]"),
+        ("display label cut deep", "[REDACTED:SECRET_ASSIG\n[truncated]"),
+        ("bare prefix at tail", "password=[REDACTED:"),
+        ("prefix fragment mid text", "password=[R\n[truncated]"),
+        ("prefix fragment deeper", "x=[RED\n[truncated]"),
+        ("second marker clipped", "a [REDACTED:SECRET_ASSIGNMENT] b [REDACTED:PRIVATE_KE\n[truncated]"),
+    ] {
+        assert!(!every_marker_is_complete(text), "must reject clipped: {case}");
+    }
+    // Pin the replaced oracle's blind spot: it accepted the clipped nonce.
+    fn weak_every_marker_is_complete(text: &str) -> bool {
+        text.split("[REDACTED:").skip(1).all(|rest| rest.contains(']'))
+    }
+    assert!(weak_every_marker_is_complete("password=[REDACTED:C6:8124\n[truncated]"));
 }
